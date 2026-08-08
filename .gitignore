@@ -1,0 +1,16 @@
+.venv/
+.build-venv/
+build/
+dist/
+*.spec
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+*.AppImage
+*.zip
+deliverables/
+upload/

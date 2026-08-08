@@ -1,0 +1,30 @@
+[project]
+name = "pipewire-app-launcher"
+version = "0.1.1"
+description = "Launch and manage JACK applications through PipeWire"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+authors = [{ name = "Triplora" }]
+keywords = ["pipewire", "jack", "audio", "linux", "launcher"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: X11 Applications :: Qt",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = ["PySide6==6.9.1"]
+
+[project.urls]
+Homepage = "https://github.com/triplora/PipeWire-App-Launcher"
+Repository = "https://github.com/triplora/PipeWire-App-Launcher"
+Issues = "https://github.com/triplora/PipeWire-App-Launcher/issues"
+
+[project.gui-scripts]
+pipewire-app-launcher = "pipewire_launcher.__main__:main"
+
+[tool.setuptools]
+packages = ["pipewire_launcher"]

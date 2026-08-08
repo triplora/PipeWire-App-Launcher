@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=PipeWire App Launcher
+Comment=Launch JACK applications through PipeWire
+Exec=pipewire-app-launcher
+Icon=pipewire-app-launcher
+Categories=AudioVideo;Audio;Utility;
+Terminal=false
