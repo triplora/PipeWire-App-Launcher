@@ -16,6 +16,8 @@ class BuildAppImageContractTests(unittest.TestCase):
         self.base = Path(self.tmp.name)
         self.tool = self.base / "validated-appimagetool"
         self.runtime = self.base / "runtime-x86_64"
+        self.xcb_cursor_lib = self.base / "libxcb-cursor.so.0"
+        self.xcb_cursor_lib.write_bytes(b"fake libxcb-cursor.so.0")
         self.tool.write_text(
             "#!/bin/sh\n"
             "if [ \"$1\" = \"--version\" ]; then echo 'appimagetool 1.9.1-test'; exit 0; fi\n"
@@ -33,6 +35,8 @@ class BuildAppImageContractTests(unittest.TestCase):
     def run_build(self, *args, extra_env=None):
         env = os.environ.copy()
         env["APPIMAGETOOL_LOG"] = str(self.base / "tool.log")
+        env["LDCONFIG_LOG"] = str(self.base / "ldconfig.log")
+        env["XCB_CURSOR_LIBRARY"] = str(self.xcb_cursor_lib)
         fake_bin = self.base / "bin"
         fake_bin.mkdir(exist_ok=True)
         env["PATH"] = f"{fake_bin}:{env['PATH']}"
@@ -58,6 +62,17 @@ class BuildAppImageContractTests(unittest.TestCase):
         fake_ldd = fake_bin / "ldd"
         fake_ldd.write_text("#!/bin/sh\nexit 0\n")
         fake_ldd.chmod(0o755)
+        fake_ldconfig = fake_bin / "ldconfig"
+        fake_ldconfig.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"-p\" ]; then\n"
+            "  printf 'executable=%s\\npath=%s\\nlibrary=%s\\n' \"$0\" \"$PATH\" \"$XCB_CURSOR_LIBRARY\" > \"$LDCONFIG_LOG\"\n"
+            "  printf '%s\\n' \"\\tlibxcb-cursor.so.0 (libc6,x86-64) => $XCB_CURSOR_LIBRARY\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 1\n"
+        )
+        fake_ldconfig.chmod(0o755)
         env.update(extra_env or {})
         return subprocess.run(
             [
@@ -106,6 +121,11 @@ class BuildAppImageContractTests(unittest.TestCase):
         self.assertFalse((ROOT / "build").exists())
         self.assertFalse((ROOT / "dist").exists())
         self.assertFalse((work / "run").exists())
+        ldconfig_log = (self.base / "ldconfig.log").read_text()
+        self.assertIn(f"executable={self.base / 'bin' / 'ldconfig'}", ldconfig_log)
+        self.assertIn(f"path={self.base / 'bin'}:", ldconfig_log)
+        self.assertIn(f"library={self.xcb_cursor_lib}", ldconfig_log)
+        self.assertTrue(str(self.xcb_cursor_lib).startswith(str(self.base) + os.sep))
         self.assertIn("AppDir", (self.base / "tool.log").read_text())
         second = self.run_build("--work-dir", str(work), "--output-dir", str(output))
         self.assertNotEqual(second.returncode, 0)
