@@ -1,5 +1,7 @@
 import hashlib
 import os
+import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -8,6 +10,29 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "build-appimage.sh"
+
+
+def snapshot_tree(root):
+    snapshot = {}
+    for path in sorted((root, *root.rglob("*")), key=str):
+        relative = path.relative_to(root)
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            snapshot[str(relative)] = ("symlink", os.readlink(path))
+        elif stat.S_ISDIR(metadata.st_mode):
+            snapshot[str(relative)] = (
+                "directory", metadata.st_mode, metadata.st_ino, metadata.st_mtime_ns
+            )
+        else:
+            snapshot[str(relative)] = (
+                "file",
+                metadata.st_mode,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+    return snapshot
 
 
 class BuildAppImageContractTests(unittest.TestCase):
@@ -32,7 +57,7 @@ class BuildAppImageContractTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_build(self, *args, extra_env=None):
+    def run_build(self, *args, extra_env=None, root=ROOT, script=SCRIPT):
         env = os.environ.copy()
         env["APPIMAGETOOL_LOG"] = str(self.base / "tool.log")
         env["LDCONFIG_LOG"] = str(self.base / "ldconfig.log")
@@ -76,12 +101,12 @@ class BuildAppImageContractTests(unittest.TestCase):
         env.update(extra_env or {})
         return subprocess.run(
             [
-                "bash", str(SCRIPT), "--appimagetool", str(self.tool),
+                "bash", str(script), "--appimagetool", str(self.tool),
                 "--appimagetool-sha256", self.tool_digest,
                 "--runtime-file", str(self.runtime), "--runtime-sha256",
                 self.runtime_digest, *args,
             ],
-            cwd=ROOT, env=env, text=True, capture_output=True,
+            cwd=root, env=env, text=True, capture_output=True,
         )
 
     def test_rejects_forbidden_work_dirs_and_symlink(self):
@@ -112,14 +137,21 @@ class BuildAppImageContractTests(unittest.TestCase):
     def test_isolates_build_and_preserves_external_output(self):
         work = self.base / "work"
         output = self.base / "output"
+        checkout_before = snapshot_tree(ROOT)
+        products_before = {
+            path: (ROOT / path).exists()
+            for path in (".build-venv", "build", "dist")
+        }
         result = self.run_build("--work-dir", str(work), "--output-dir", str(output))
         self.assertEqual(result.returncode, 0, result.stderr)
         artifact = output / "PipeWire-App-Launcher-x86_64.AppImage"
         self.assertTrue(artifact.is_file())
         self.assertGreater(artifact.stat().st_size, 0)
-        self.assertFalse((ROOT / ".build-venv").exists())
-        self.assertFalse((ROOT / "build").exists())
-        self.assertFalse((ROOT / "dist").exists())
+        self.assertEqual(checkout_before, snapshot_tree(ROOT))
+        for path, existed in products_before.items():
+            self.assertEqual(existed, (ROOT / path).exists(), path)
+            if not existed:
+                self.assertFalse((ROOT / path).exists())
         self.assertFalse((work / "run").exists())
         ldconfig_log = (self.base / "ldconfig.log").read_text()
         self.assertIn(f"executable={self.base / 'bin' / 'ldconfig'}", ldconfig_log)
@@ -130,6 +162,34 @@ class BuildAppImageContractTests(unittest.TestCase):
         second = self.run_build("--work-dir", str(work), "--output-dir", str(output))
         self.assertNotEqual(second.returncode, 0)
         self.assertIn("refusing to overwrite", second.stderr)
+
+    def test_preserves_preexisting_build_directory(self):
+        checkout = self.base / "checkout"
+        (checkout / "scripts").mkdir(parents=True)
+        shutil.copy2(SCRIPT, checkout / "scripts" / SCRIPT.name)
+        shutil.copytree(ROOT / "assets", checkout / "assets")
+        shutil.copy2(ROOT / "requirements.txt", checkout / "requirements.txt")
+        build = checkout / "build"
+        build.mkdir()
+        sentinel = build / "sentinel.txt"
+        sentinel.write_text("preexisting build sentinel\n")
+        checkout_before = snapshot_tree(checkout)
+        build_before = snapshot_tree(build)
+        output = self.base / "preexisting-output"
+
+        result = self.run_build(
+            "--work-dir", str(self.base / "preexisting-work"),
+            "--output-dir", str(output),
+            root=checkout,
+            script=checkout / "scripts" / SCRIPT.name,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        artifact = output / "PipeWire-App-Launcher-x86_64.AppImage"
+        self.assertTrue(artifact.is_file())
+        self.assertEqual(build_before, snapshot_tree(build))
+        self.assertEqual(checkout_before, snapshot_tree(checkout))
+        self.assertEqual(sentinel.read_text(), "preexisting build sentinel\n")
 
     def test_rejects_unsupported_architecture(self):
         uname = self.base / "bin" / "uname"
