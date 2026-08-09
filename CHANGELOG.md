@@ -12,6 +12,25 @@ and the project follows [Semantic Versioning](https://semver.org/).
 - Display PipeWire and JACK compatibility health.
 - Add starter profiles for common Linux audio applications.
 
+## [0.1.2] - Unreleased
+
+### Added
+
+- Independently supervise one runtime process per profile.
+- Track explicit process states, PIDs, timestamps, and exit codes.
+- Keep bounded stdout and stderr logs per profile, with per-profile clearing.
+- Prevent duplicate starts and target Stop only at the selected profile.
+- Detect spontaneous termination and provide graceful-stop/forced-kill fallback.
+- Confirm and supervise active processes when closing the launcher.
+
+### Compatibility
+
+- Continue loading and saving profile collections in JSON version 1 from v0.1.1.
+- Descendant process groups are not signaled directly; termination uses the
+  supervised QProcess until safe process-session isolation is introduced.
+- Launcher shutdown has a bounded final deadline if a process emits no
+  completion signal after forced termination.
+
 ## [0.1.1] - 2026-08-08
 
 ### Fixed
