@@ -1,6 +1,6 @@
 [project]
 name = "pipewire-app-launcher"
-version = "0.1.1"
+version = "0.1.2"
 description = "Launch and manage JACK applications through PipeWire"
 readme = "README.md"
 requires-python = ">=3.10"
