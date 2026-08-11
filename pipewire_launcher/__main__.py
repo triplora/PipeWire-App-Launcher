@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 import sys
+
+from pipewire_launcher import __version__
+
+
+if "--version" in sys.argv[1:]:
+    print(f"PipeWire App Launcher {__version__}")
+    raise SystemExit(0)
+
+
 import time
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Qt
