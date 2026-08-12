@@ -17,11 +17,18 @@ from PySide6.QtGui import QAction, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
-    QPushButton, QSplitter, QStatusBar, QToolBar, QVBoxLayout, QWidget,
+    QPushButton, QSplitter, QStatusBar, QToolBar, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from pipewire_launcher.core import Profile, ProfileStore, command_parts, command_preview, parse_arguments, parse_environment, validate_profile
 from pipewire_launcher.process_supervision import ProcessExecution, ProcessRegistry, ProcessState, ProcessTerminator
+from pipewire_launcher.pipewire_discovery_runner import (
+    PipeWireDiscoveryFailure,
+    PipeWireDiscoveryRunner,
+    PipeWireDumpResult,
+    RunnerState,
+)
 
 
 class MainWindow(QMainWindow):
@@ -39,7 +46,11 @@ class MainWindow(QMainWindow):
         self.close_deadline: float | None = None
         self.close_force_deadline: float | None = None
         self.current_id: str | None = None
+        self._closing_started = False
+        self._discovery_request_id: str | None = None
+        self.discovery_runner = PipeWireDiscoveryRunner(self)
         self._build_ui()
+        self._connect_discovery_signals()
         self._load()
 
     def _build_ui(self):
@@ -74,9 +85,126 @@ class MainWindow(QMainWindow):
         self.process_info = QLabel("State: stopped")
         self.process_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.log = QPlainTextEdit(); self.log.setReadOnly(True); self.log.setMaximumBlockCount(20000); self.log.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
-        right = QWidget(); rv = QVBoxLayout(right); rv.addLayout(form); rv.addLayout(buttons); rv.addWidget(self.process_info); rv.addWidget(QLabel("Process output")); rv.addWidget(self.log, 1)
+        self.discovery_refresh_button = QPushButton("Refresh PipeWire"); self.discovery_refresh_button.clicked.connect(self.refresh_discovery)
+        self.discovery_cancel_button = QPushButton("Cancel"); self.discovery_cancel_button.clicked.connect(self.cancel_discovery)
+        self.discovery_state = QLabel("Not queried")
+        self.discovery_tree = QTreeWidget(); self.discovery_tree.setHeaderLabels(["Name", "Type", "Application", "PID", "Media class", "ID"]); self.discovery_tree.setRootIsDecorated(True); self.discovery_tree.setUniformRowHeights(True)
+        discovery_buttons = QHBoxLayout(); discovery_buttons.addWidget(self.discovery_refresh_button); discovery_buttons.addWidget(self.discovery_cancel_button); discovery_buttons.addStretch()
+        right = QWidget(); rv = QVBoxLayout(right); rv.addLayout(form); rv.addLayout(buttons); rv.addWidget(self.process_info); rv.addWidget(QLabel("Process output")); rv.addWidget(self.log, 1); rv.addWidget(QLabel("PipeWire Discovery")); rv.addLayout(discovery_buttons); rv.addWidget(self.discovery_state); rv.addWidget(self.discovery_tree)
         split = QSplitter(); split.addWidget(left); split.addWidget(right); split.setSizes([280, 800]); self.setCentralWidget(split)
         self.setStatusBar(QStatusBar()); self.statusBar().showMessage("Ready")
+        self._update_discovery_controls()
+
+    def _connect_discovery_signals(self):
+        self.discovery_runner.state_changed.connect(self._discovery_state_changed)
+        self.discovery_runner.succeeded.connect(self._discovery_succeeded)
+        self.discovery_runner.failed.connect(self._discovery_failed)
+        self.discovery_runner.request_rejected.connect(self._discovery_request_rejected)
+        self.discovery_runner.finished.connect(self._discovery_finished)
+
+    def _update_discovery_controls(self):
+        active = self.discovery_runner.state.active
+        self.discovery_refresh_button.setEnabled(bool(self.current_id) and not active and not self._closing_started)
+        self.discovery_cancel_button.setEnabled(active and not self._closing_started)
+
+    def _discovery_state_changed(self, state: RunnerState):
+        if self._closing_started or self._discovery_request_id != self.current_id:
+            return
+        if state not in {RunnerState.STARTING, RunnerState.RUNNING, RunnerState.CANCELLING}:
+            return
+        labels = {
+            RunnerState.STARTING: "Starting discovery…",
+            RunnerState.RUNNING: "Discovering PipeWire nodes…",
+            RunnerState.CANCELLING: "Cancelling…",
+        }
+        self.discovery_state.setText(labels[state])
+        self._update_discovery_controls()
+
+    def _discovery_succeeded(self, result: PipeWireDumpResult):
+        if (
+            self._closing_started
+            or result.request_id != self.current_id
+            or result.request_id != self._discovery_request_id
+        ):
+            return
+        snapshot = result.snapshot
+        self.discovery_tree.clear()
+        for node in snapshot.nodes:
+            node_item = QTreeWidgetItem([
+                node.name, "Node", node.application_name or "",
+                "" if node.process_id is None else str(node.process_id),
+                node.media_class or "", str(node.object_id),
+            ])
+            self.discovery_tree.addTopLevelItem(node_item)
+            for port in node.ports:
+                node_item.addChild(QTreeWidgetItem([
+                    port.name, port.direction.value.title(), "", "", "", str(port.object_id),
+                ]))
+        count = len(snapshot.nodes)
+        self.discovery_state.setText(f"{count} nodes discovered" if count else "No PipeWire nodes found")
+        self._update_discovery_controls()
+
+    def _discovery_failed(self, failure: PipeWireDiscoveryFailure):
+        if (
+            self._closing_started
+            or failure.request_id != self.current_id
+            or failure.request_id != self._discovery_request_id
+        ):
+            return
+        if failure.category.value == "timeout":
+            self.discovery_state.setText("Discovery timed out")
+        elif failure.category.value == "cancelled":
+            self.discovery_state.setText("Discovery cancelled")
+        else:
+            message = " ".join(str(failure.message).split())[:240]
+            detail = f"{failure.category.value}: {message}" if message else failure.category.value
+            self.discovery_state.setText(f"Discovery unavailable — {detail}")
+        self._update_discovery_controls()
+
+    def _discovery_request_rejected(self, failure: PipeWireDiscoveryFailure):
+        if (
+            self._closing_started
+            or failure.request_id != self.current_id
+            or failure.request_id != self._discovery_request_id
+        ):
+            return
+        message = " ".join(str(failure.message).split())[:240]
+        detail = f": {message}" if message else ""
+        self.statusBar().showMessage(f"PipeWire discovery request rejected{detail}")
+        self._update_discovery_controls()
+
+    def _discovery_finished(self):
+        if not self._closing_started:
+            self._update_discovery_controls()
+
+    def refresh_discovery(self):
+        if self._closing_started or not self.current_id or self.discovery_runner.state.active:
+            self._update_discovery_controls()
+            return False
+        request_id = self.current_id
+        started = self.discovery_runner.start(request_id=request_id)
+        if started:
+            self._discovery_request_id = request_id
+            state = self.discovery_runner.state
+            if state in {RunnerState.STARTING, RunnerState.RUNNING, RunnerState.CANCELLING}:
+                self._discovery_state_changed(state)
+            else:
+                result = getattr(self.discovery_runner, "result", None)
+                failure = getattr(self.discovery_runner, "error", None)
+                if result is not None:
+                    self._discovery_succeeded(result)
+                elif failure is not None:
+                    self._discovery_failed(failure)
+        self._update_discovery_controls()
+        return started
+
+    def cancel_discovery(self):
+        if self._closing_started or not self.discovery_runner.state.active:
+            self._update_discovery_controls()
+            return False
+        cancelled = self.discovery_runner.cancel()
+        self._update_discovery_controls()
+        return cancelled
 
     def _load(self):
         try: self.profiles = self.store.load()
@@ -101,7 +229,7 @@ class MainWindow(QMainWindow):
         if not current: return
         self.current_id = current.data(Qt.UserRole); p = self.selected_profile()
         if not p: return
-        self.name.setText(p.name); self.executable.setText(p.executable); self.arguments.setText(' '.join(__import__('shlex').quote(x) for x in p.arguments)); self.cwd.setText(p.working_directory); self.environment.setPlainText('\n'.join(f"{k}={v}" for k,v in p.environment.items())); self.notes.setPlainText(p.notes); self.enabled.setChecked(p.enabled); self.update_preview(); self._refresh_process_view()
+        self.name.setText(p.name); self.executable.setText(p.executable); self.arguments.setText(' '.join(__import__('shlex').quote(x) for x in p.arguments)); self.cwd.setText(p.working_directory); self.environment.setPlainText('\n'.join(f"{k}={v}" for k,v in p.environment.items())); self.notes.setPlainText(p.notes); self.enabled.setChecked(p.enabled); self.update_preview(); self._refresh_process_view(); self._update_discovery_controls()
 
     def profile_from_form(self):
         return Profile(name=self.name.text().strip(), executable=self.executable.text().strip(), arguments=parse_arguments(self.arguments.text()), working_directory=self.cwd.text().strip(), environment=parse_environment(self.environment.toPlainText()), notes=self.notes.toPlainText().strip(), enabled=self.enabled.isChecked(), id=self.current_id or __import__('uuid').uuid4().hex)
@@ -269,12 +397,17 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         active = [record for record in self.registry.records() if record.active]
         if not active:
+            if not self._closing_started:
+                self._closing_started = True
+                self.discovery_runner.shutdown()
             event.accept(); return
         if not self.close_requested:
             answer = QMessageBox.question(self, "Processes running", "Stop all running processes before closing?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if answer != QMessageBox.Yes:
                 event.ignore(); return
             self.close_requested = True
+            self._closing_started = True
+            self.discovery_runner.shutdown()
             for record in active:
                 if self.registry.request_stop(record.profile_id, record.generation, record.process):
                     self.terminator.graceful(record.process)
