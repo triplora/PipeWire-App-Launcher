@@ -1,11 +1,25 @@
 import enum
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 import pipewire_launcher.__main__ as launcher
 from pipewire_launcher.core import Profile
+from pipewire_launcher.pipewire_discovery import (
+    DiscoveryState,
+    PipeWireDiscoverySnapshot,
+    PipeWireNode,
+    PipeWirePort,
+    PortDirection,
+)
+from pipewire_launcher.pipewire_discovery_runner import (
+    DiscoveryFailureCategory,
+    PipeWireDiscoveryFailure,
+    PipeWireDumpResult,
+    RunnerState,
+)
 from pipewire_launcher.process_supervision import ProcessState
 
 
@@ -151,6 +165,74 @@ class FakeCloseEvent:
         self.ignored = True
 
 
+class FakeDiscoveryRunner:
+    instances = []
+
+    def __init__(self, _parent=None):
+        self.state_changed = Signal()
+        self.succeeded = Signal()
+        self.failed = Signal()
+        self.request_rejected = Signal()
+        self.finished = Signal()
+        self.state = RunnerState.IDLE
+        self.start_calls = []
+        self.cancel_calls = 0
+        self.shutdown_calls = 0
+        self.result = None
+        self.error = None
+        type(self).instances.append(self)
+
+    def start(self, request_id=None):
+        self.start_calls.append(request_id)
+        if self.state.active:
+            self.request_rejected.emit(PipeWireDiscoveryFailure(DiscoveryFailureCategory.ALREADY_RUNNING, "busy", request_id))
+            return False
+        self.state = RunnerState.STARTING
+        self.state_changed.emit(self.state)
+        return True
+
+    def cancel(self):
+        if self.state not in {RunnerState.STARTING, RunnerState.RUNNING}:
+            return False
+        self.cancel_calls += 1
+        self.state = RunnerState.CANCELLING
+        self.state_changed.emit(self.state)
+        return True
+
+    def shutdown(self):
+        self.shutdown_calls += 1
+        return self.shutdown_calls == 1
+
+    def started(self):
+        self.state = RunnerState.RUNNING
+        self.state_changed.emit(self.state)
+
+    def succeed(self, result):
+        self.result = result
+        self.state = RunnerState.SUCCEEDED
+        self.state_changed.emit(self.state)
+        self.succeeded.emit(result)
+        self.finished.emit()
+
+    def fail(self, request_id, category=DiscoveryFailureCategory.INVALID_OUTPUT, message="safe failure", stderr=b"raw stderr"):
+        self.error = PipeWireDiscoveryFailure(category, message, request_id, stderr)
+        self.state = RunnerState.TIMED_OUT if category is DiscoveryFailureCategory.TIMEOUT else (
+            RunnerState.CANCELLED if category is DiscoveryFailureCategory.CANCELLED else RunnerState.FAILED
+        )
+        self.state_changed.emit(self.state)
+        self.failed.emit(self.error)
+        self.finished.emit()
+
+    def complete_cancel(self, request_id):
+        self.fail(request_id, DiscoveryFailureCategory.CANCELLED, "cancelled", b"raw stderr")
+
+    def emit_late_state(self, state):
+        self.state_changed.emit(state)
+
+    def reject(self, request_id, message="discovery request already running"):
+        self.request_rejected.emit(PipeWireDiscoveryFailure(DiscoveryFailureCategory.ALREADY_RUNNING, message, request_id, b"raw stderr"))
+
+
 class MainWindowQtTests(unittest.TestCase):
     app = None
 
@@ -161,6 +243,7 @@ class MainWindowQtTests(unittest.TestCase):
     def setUp(self):
         self.patches = [
             patch.object(launcher, "ProfileStore", FakeStore),
+            patch.object(launcher, "PipeWireDiscoveryRunner", FakeDiscoveryRunner),
             patch.object(launcher, "QProcess", FakeProcess),
             patch.object(launcher, "QTimer", FakeTimer),
             patch.object(launcher, "QMessageBox", FakeMessageBox),
@@ -169,6 +252,7 @@ class MainWindowQtTests(unittest.TestCase):
         for item in self.patches:
             item.start()
         self.window = launcher.MainWindow()
+        self.discovery = self.window.discovery_runner
         self.processes = []
 
     def tearDown(self):
@@ -177,6 +261,7 @@ class MainWindowQtTests(unittest.TestCase):
         self.app.processEvents()
         for item in reversed(self.patches):
             item.stop()
+        FakeDiscoveryRunner.instances.clear()
 
     def run_selected(self):
         self.window.run_current()
@@ -337,6 +422,153 @@ class MainWindowQtTests(unittest.TestCase):
         event = FakeCloseEvent()
         self.window.closeEvent(event)
         self.assertTrue(event.accepted)
+        self.assertEqual(self.discovery.shutdown_calls, 1)
+
+    def test_discovery_section_starts_idle_and_has_columns(self):
+        self.assertEqual(self.window.discovery_state.text(), "Not queried")
+        self.assertEqual([self.window.discovery_tree.headerItem().text(i) for i in range(6)], ["Name", "Type", "Application", "PID", "Media class", "ID"])
+        self.assertTrue(self.window.discovery_refresh_button.isEnabled())
+        self.assertFalse(self.window.discovery_cancel_button.isEnabled())
+
+    def test_refresh_uses_selected_profile_id_and_selection_does_not_start(self):
+        self.select_row(1)
+        self.assertEqual(self.discovery.start_calls, [])
+        self.window.refresh_discovery()
+        self.assertEqual(self.discovery.start_calls, ["profile-two"])
+
+    def test_refresh_without_profile_does_not_start(self):
+        self.window.current_id = None
+        self.window._update_discovery_controls()
+        self.window.refresh_discovery()
+        self.assertEqual(self.discovery.start_calls, [])
+
+    def test_simultaneous_refresh_is_blocked_and_active_states_update_controls(self):
+        self.window.refresh_discovery()
+        self.assertEqual(self.discovery.start_calls, ["profile-one"])
+        self.assertFalse(self.window.discovery_refresh_button.isEnabled())
+        self.assertTrue(self.window.discovery_cancel_button.isEnabled())
+        self.discovery.started()
+        self.window.refresh_discovery()
+        self.assertEqual(self.discovery.start_calls, ["profile-one"])
+        self.assertEqual(self.window.discovery_state.text(), "Discovering PipeWire nodes…")
+
+    def test_success_renders_node_and_ports(self):
+        self.window.refresh_discovery()
+        node = PipeWireNode(10, "node", application_name="app", process_id=42, media_class="Audio/Source", ports=(PipeWirePort(11, 10, "in", direction=PortDirection.INPUT),))
+        snapshot = PipeWireDiscoverySnapshot("profile-one", 1, datetime.now(timezone.utc), (node,), DiscoveryState.AVAILABLE)
+        self.discovery.succeed(PipeWireDumpResult("profile-one", snapshot, b"", 0))
+        self.assertEqual(self.window.discovery_state.text(), "1 nodes discovered")
+        self.assertEqual(self.window.discovery_tree.topLevelItemCount(), 1)
+        self.assertEqual(self.window.discovery_tree.topLevelItem(0).child(0).text(1), "Input")
+
+    def test_empty_success_shows_empty_state(self):
+        self.window.refresh_discovery()
+        snapshot = PipeWireDiscoverySnapshot("profile-one", 1, datetime.now(timezone.utc), (), DiscoveryState.EMPTY)
+        self.discovery.succeed(PipeWireDumpResult("profile-one", snapshot, b"", 0))
+        self.assertEqual(self.window.discovery_state.text(), "No PipeWire nodes found")
+
+    def test_late_result_for_other_profile_is_ignored(self):
+        self.window.refresh_discovery()
+        node = PipeWireNode(10, "kept")
+        snapshot = PipeWireDiscoverySnapshot("profile-one", 1, datetime.now(timezone.utc), (node,), DiscoveryState.AVAILABLE)
+        self.discovery.succeed(PipeWireDumpResult("profile-one", snapshot, b"", 0))
+        self.select_row(1)
+        self.discovery.succeed(PipeWireDumpResult("profile-one", snapshot, b"", 0))
+        self.assertEqual(self.window.discovery_tree.topLevelItem(0).text(0), "kept")
+        self.assertNotEqual(self.window.discovery_state.text(), "2 nodes discovered")
+
+    def test_failure_preserves_tree_and_hides_diagnostics(self):
+        self.window.refresh_discovery()
+        snapshot = PipeWireDiscoverySnapshot("profile-one", 1, datetime.now(timezone.utc), (PipeWireNode(1, "kept"),), DiscoveryState.AVAILABLE)
+        self.discovery.succeed(PipeWireDumpResult("profile-one", snapshot, b"", 0))
+        self.window.refresh_discovery()
+        self.discovery.fail("profile-one")
+        self.assertEqual(self.window.discovery_tree.topLevelItemCount(), 1)
+        self.assertEqual(self.window.discovery_state.text(), "Discovery unavailable — invalid_output: safe failure")
+        self.assertNotIn("raw stderr", self.window.discovery_state.text())
+
+    def test_cancel_is_idempotent(self):
+        self.window.refresh_discovery()
+        self.assertTrue(self.window.cancel_discovery())
+        self.assertFalse(self.window.cancel_discovery())
+        self.assertEqual(self.discovery.cancel_calls, 1)
+        self.discovery.complete_cancel("profile-one")
+        self.assertEqual(self.window.discovery_state.text(), "Discovery cancelled")
+
+    def test_old_profile_terminal_states_do_not_change_selected_profile_ui(self):
+        self.window.refresh_discovery()
+        self.select_row(1)
+        for state, category in (
+            (RunnerState.TIMED_OUT, DiscoveryFailureCategory.TIMEOUT),
+            (RunnerState.CANCELLED, DiscoveryFailureCategory.CANCELLED),
+            (RunnerState.FAILED, DiscoveryFailureCategory.INVALID_OUTPUT),
+        ):
+            before_label = self.window.discovery_state.text()
+            before_items = self.window.discovery_tree.topLevelItemCount()
+            self.discovery.emit_late_state(state)
+            self.discovery.fail("profile-one", category, "old profile failure", b"old stderr")
+            self.assertEqual(self.window.discovery_state.text(), before_label)
+            self.assertEqual(self.window.discovery_tree.topLevelItemCount(), before_items)
+
+    def test_late_result_cannot_replace_snapshot_for_new_profile(self):
+        self.window.current_id = "profile-two"
+        self.window._discovery_request_id = "profile-two"
+        kept = PipeWireDiscoverySnapshot("profile-two", 2, datetime.now(timezone.utc), (PipeWireNode(20, "B node"),), DiscoveryState.AVAILABLE)
+        self.discovery.succeed(PipeWireDumpResult("profile-two", kept, b"", 0))
+        self.discovery.succeed(PipeWireDumpResult("profile-one", PipeWireDiscoverySnapshot("profile-one", 1, datetime.now(timezone.utc), (PipeWireNode(10, "A node"),), DiscoveryState.AVAILABLE), b"", 0))
+        self.assertEqual(self.window.discovery_tree.topLevelItem(0).text(0), "B node")
+
+    def test_request_rejected_valid_message_is_safe_and_non_modal(self):
+        self.window._discovery_request_id = "profile-one"
+        self.discovery.reject("profile-one", "discovery request already running")
+        self.assertEqual(self.window.statusBar().currentMessage(), "PipeWire discovery request rejected: discovery request already running")
+        self.assertNotIn("raw stderr", self.window.statusBar().currentMessage())
+
+    def test_old_request_rejected_is_ignored(self):
+        self.window._discovery_request_id = "profile-two"
+        self.window.statusBar().showMessage("unchanged")
+        self.discovery.reject("profile-one", "old rejection")
+        self.assertEqual(self.window.statusBar().currentMessage(), "unchanged")
+
+    def test_generic_failure_sanitizes_message_and_never_shows_stderr(self):
+        self.window.refresh_discovery()
+        message = "bad\noutput\t" + "x" * 300
+        self.discovery.fail("profile-one", DiscoveryFailureCategory.PARSER_ERROR, message, b"SECRET STDERR")
+        label = self.window.discovery_state.text()
+        self.assertTrue(label.startswith("Discovery unavailable — parser_error: bad output x"))
+        self.assertLessEqual(len(label.split(" — ", 1)[1]), 240 + len("parser_error: "))
+        self.assertNotIn("SECRET STDERR", label)
+        self.assertNotIn("SECRET STDERR", self.window.statusBar().currentMessage())
+
+    def test_close_rejection_preserves_runner(self):
+        self.run_selected()
+        FakeMessageBox.answer = FakeMessageBox.No
+        event = FakeCloseEvent()
+        self.window.closeEvent(event)
+        self.assertTrue(event.ignored)
+        self.assertEqual(self.discovery.shutdown_calls, 0)
+        FakeMessageBox.answer = FakeMessageBox.Yes
+
+    def test_confirmed_close_with_active_process_shuts_runner_once(self):
+        self.run_selected()
+        FakeMessageBox.answer = FakeMessageBox.Yes
+        event = FakeCloseEvent()
+        self.window.closeEvent(event)
+        self.window.closeEvent(event)
+        self.assertEqual(self.discovery.shutdown_calls, 1)
+
+    def test_discovery_callbacks_after_close_do_not_change_ui(self):
+        self.window.refresh_discovery()
+        self.window._closing_started = True
+        before = self.window.discovery_state.text()
+        snapshot = PipeWireDiscoverySnapshot("profile-one", 1, datetime.now(timezone.utc), (PipeWireNode(1, "late"),), DiscoveryState.AVAILABLE)
+        self.discovery.succeed(PipeWireDumpResult("profile-one", snapshot, b"", 0))
+        self.assertEqual(self.window.discovery_state.text(), before)
+        self.assertEqual(self.window.discovery_tree.topLevelItemCount(), 0)
+
+    def test_discovery_tests_never_construct_real_pw_dump_process(self):
+        self.assertIsInstance(self.window.discovery_runner, FakeDiscoveryRunner)
+        self.assertEqual(len(FakeDiscoveryRunner.instances), 1)
 
 
 if __name__ == "__main__":
