@@ -167,6 +167,12 @@ class ProcessRegistry:
         record = self._records[profile_id]
         if record.state in {ProcessState.EXITED, ProcessState.FAILED, ProcessState.STOPPED}:
             return False
+        if record.stop_requested:
+            record.error_message = None
+            record.state = ProcessState.STOPPED if record.force_kill_requested else ProcessState.STOPPING
+            if record.finished_at is None and record.state is ProcessState.STOPPED:
+                record.finished_at = utc_now()
+            return True
         record.error_message = message
         record.state = ProcessState.FAILED
         if record.finished_at is None:
@@ -189,7 +195,10 @@ class ProcessRegistry:
         record.exit_code = exit_code
         if record.finished_at is None:
             record.finished_at = utc_now()
-        if record.state != ProcessState.FAILED:
+        if record.stop_requested:
+            record.error_message = None
+            record.state = ProcessState.STOPPED
+        elif record.state != ProcessState.FAILED:
             record.state = ProcessState.EXITED
         return True
 

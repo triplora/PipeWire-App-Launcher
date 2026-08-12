@@ -328,6 +328,16 @@ class MainWindow(QMainWindow):
                 self.registry.append_event(profile_id, generation, process, f"[process error: {_error.name}]\n")
             self._refresh_process_view()
             return
+        record = self.registry.get(profile_id)
+        if (
+            _error == QProcess.Crashed
+            and record
+            and self.registry.is_current(profile_id, generation, process)
+            and record.stop_requested
+        ):
+            self.registry.append_event(profile_id, generation, process, "[stop requested; process termination reported]\n")
+            self._refresh_process_view()
+            return
         if self.registry.fail(profile_id, generation, process, process.errorString()):
             self._stop_timer(profile_id, generation)
             record = self.registry.get(profile_id)

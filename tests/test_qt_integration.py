@@ -369,6 +369,61 @@ class MainWindowQtTests(unittest.TestCase):
         timer.timeout.emit()
         self.assertEqual(second.process.kill_calls, 1)
 
+    def test_requested_stop_crash_exit_is_stopped_without_error(self):
+        record = self.run_selected()
+        record.process.started.emit()
+        self.window.stop_current()
+        record.process.errorOccurred.emit(FakeProcess.Crashed)
+        self.assertEqual(record.state, ProcessState.STOPPING)
+        self.assertNotIn("Process crashed", self.window.process_info.text())
+        record.process.finished.emit(15, None)
+        self.assertEqual(record.state, ProcessState.STOPPED)
+        self.assertIn("State: stopped", self.window.process_info.text())
+        self.assertNotIn("Error: Process crashed", self.window.process_info.text())
+        self.assertEqual(record.event_log.text().count("[finished: stopped"), 1)
+
+    def test_requested_stop_force_kill_finishes_stopped(self):
+        record = self.run_selected()
+        record.process.started.emit()
+        self.window.stop_current()
+        timer = self.window.stop_timers[("profile-one", record.generation)]
+        timer.timeout.emit()
+        record.process.errorOccurred.emit(FakeProcess.Crashed)
+        record.process.finished.emit(9, None)
+        self.assertEqual(record.state, ProcessState.STOPPED)
+        self.assertEqual(record.process.kill_calls, 1)
+        self.assertNotIn("Process crashed", self.window.process_info.text())
+
+    def test_spontaneous_crash_and_external_sigterm_remain_failed(self):
+        crashed = self.run_selected()
+        crashed.process.started.emit()
+        crashed.process.errorOccurred.emit(FakeProcess.Crashed)
+        crashed.process.finished.emit(15, None)
+        self.assertEqual(crashed.state, ProcessState.FAILED)
+        self.assertIn("State: failed", self.window.process_info.text())
+
+        self.select_row(1)
+        external = self.run_selected()
+        external.process.started.emit()
+        external.process.errorOccurred.emit(FakeProcess.Crashed)
+        external.process.finished.emit(15, None)
+        self.assertEqual(external.state, ProcessState.FAILED)
+
+    def test_stop_intent_is_reset_for_new_execution_and_stale_callback_is_ignored(self):
+        old = self.run_selected()
+        old.process.started.emit()
+        self.window.stop_current()
+        old.process.finished.emit(15, None)
+        self.assertEqual(old.state, ProcessState.STOPPED)
+        self.window.run_current()
+        new = self.window.registry.get("profile-one")
+        self.assertIsNot(new, old)
+        self.assertFalse(new.stop_requested)
+        old.process.errorOccurred.emit(FakeProcess.Crashed)
+        self.assertEqual(new.state, ProcessState.STARTING)
+        new.process.started.emit()
+        self.assertEqual(new.state, ProcessState.RUNNING)
+
     def test_finished_cleans_stop_timer_and_old_timer_cannot_kill_new_run(self):
         old = self.run_selected()
         old.process.started.emit()
