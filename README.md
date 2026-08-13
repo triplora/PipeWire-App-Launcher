@@ -155,11 +155,14 @@ The preview is a display-safe rendering. At execution time the program calls
 the profile through `/bin/sh`, so shell operators in arguments or environment
 values are not evaluated.
 
-## Contributing and security
+## Contributing, support and security
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow. Please
-report vulnerabilities according to [SECURITY.md](SECURITY.md), not through a
-public issue.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community standards. Read
+[SUPPORT.md](SUPPORT.md) before opening an Issue.
+
+Report vulnerabilities according to [SECURITY.md](SECURITY.md), never through a
+public Issue.
 
 ## License
 
