@@ -7,8 +7,9 @@ Desktop profile manager for launching JACK applications through PipeWire's
 `pw-jack` compatibility layer. Designed for Ubuntu 24.04 and distributed as a
 portable AppImage.
 
-> **Project status:** alpha. Version 0.1.2 is functionally validated on Ubuntu
-> 24.04 with Ardour connected to PipeWire through the JACK compatibility layer.
+> **Project status:** alpha. Version 0.1.3 was functionally validated on Ubuntu
+> 24.04 with PipeWire discovery and JACK applications launched through
+> `pw-jack`.
 
 ## Features
 
@@ -22,6 +23,10 @@ portable AppImage.
 - Import/export profile collections and automatic atomic saves.
 - Runtime checks for PipeWire, `pw-jack`, and the selected executable.
 - Process log and status indicator.
+- Independent per-profile process supervision and bounded logs.
+- Explicit lifecycle status, PID, and timestamps.
+- Asynchronous PipeWire node discovery.
+- Read-only discovery tree with refresh/cancel behavior.
 
 ## Run from source
 
@@ -84,7 +89,7 @@ curl -fL -o /tmp/runtime-x86_64 \
 echo '1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf  /tmp/runtime-x86_64' | sha256sum --check
 ```
 
-Build v0.1.2 with isolated directories. Both directories must be outside the
+Build v0.1.3 with isolated directories. Both directories must be outside the
 checkout; the output directory is preserved and existing artifacts are never
 overwritten:
 
