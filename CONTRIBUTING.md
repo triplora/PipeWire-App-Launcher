@@ -25,3 +25,13 @@ packages listed in the README.
 
 Do not include credentials, private audio projects, personal paths, or the
 contents of `~/.config/pipewire-app-launcher/`.
+
+## Community standards
+
+By participating, you agree to follow the
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md). Read [SUPPORT.md](SUPPORT.md) before
+opening an Issue so bug reports, feature proposals, security concerns, and
+general support requests reach the correct channel.
+
+Report vulnerabilities through the private process in
+[SECURITY.md](SECURITY.md), never through a public Issue or Pull Request.
