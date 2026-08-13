@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Support policy
+    url: https://github.com/triplora/PipeWire-App-Launcher/blob/main/SUPPORT.md
+    about: Read the support scope and choose the correct issue form.
+  - name: Report a security vulnerability
+    url: https://github.com/triplora/PipeWire-App-Launcher/security/advisories/new
+    about: Report exploitable security issues privately.

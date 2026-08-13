@@ -6,6 +6,13 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Add a project Code of Conduct and support policy.
+- Add Dependabot coverage for Python dependencies and GitHub Actions.
+- Add controlled Issue routing with blank Issues disabled.
+- Add regression tests for public project hygiene.
+
 ### Planned
 
 - Detect installed JACK-capable applications.
