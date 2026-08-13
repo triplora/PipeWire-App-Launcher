@@ -12,7 +12,42 @@ and the project follows [Semantic Versioning](https://semver.org/).
 - Display PipeWire and JACK compatibility health.
 - Add starter profiles for common Linux audio applications.
 
-## [0.1.2] - Unreleased
+## [0.1.3] - 2026-08-13
+
+### Added
+
+- Discover PipeWire nodes asynchronously through a supervised `pw-dump`
+  process.
+- Display discovered node name, type, application, PID, media class, and ID in
+  a read-only tree.
+- Support refresh, cancellation, bounded output, timeout handling, stale
+  callback rejection, and permanent discovery shutdown.
+- Preserve the last valid discovery snapshot across refresh failures and
+  cancellation.
+
+### Fixed
+
+- Classify launcher-requested process termination as stopped instead of failed.
+- Preserve failed status for spontaneous crashes, external termination, and
+  process start failures.
+- Clear crash diagnostics when termination was explicitly requested by the
+  launcher.
+
+### Safety
+
+- Keep discovery and application execution asynchronous and shell-free.
+- Retain process ownership until `QProcess` reaches `NotRunning`.
+- Keep stop intent scoped to the current process generation.
+- Preserve the JSON version 1 profile format from earlier releases.
+
+### Verified
+
+- 148 automated tests passed with zero skips and xfails.
+- PipeWire node discovery was validated against a live Ubuntu 24.04 session.
+- Ardour and Audacity were launched through `pw-jack`.
+- User-requested Stop was validated without leaving launcher processes behind.
+
+## [0.1.2] - 2026-08-11
 
 ### Added
 
@@ -54,6 +89,8 @@ and the project follows [Semantic Versioning](https://semver.org/).
 - Profile import/export, process output, and start/stop controls.
 - Reproducible AppImage build script and core unit tests.
 
-[Unreleased]: https://github.com/triplora/PipeWire-App-Launcher/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/triplora/PipeWire-App-Launcher/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/triplora/PipeWire-App-Launcher/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/triplora/PipeWire-App-Launcher/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/triplora/PipeWire-App-Launcher/releases/tag/v0.1.1
 [0.1.0]: https://github.com/triplora/PipeWire-App-Launcher/releases/tag/v0.1.0
