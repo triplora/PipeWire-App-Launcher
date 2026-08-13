@@ -103,6 +103,29 @@ class ProcessRegistryTests(unittest.TestCase):
         self.assertEqual(record.finished_at, first_finished_at)
         self.assertFalse(registry.finish("profile", record.generation, process, 127))
 
+    def test_requested_stop_normalizes_terminal_failure_to_stopped(self):
+        registry = ProcessRegistry()
+        process = FakeProcess()
+        record = registry.start("profile", process)
+        registry.set_running("profile", record.generation, process, 7)
+        self.assertTrue(registry.request_stop("profile", record.generation, process))
+        self.assertTrue(registry.fail("profile", record.generation, process, "Process crashed"))
+        self.assertEqual(record.state, ProcessState.STOPPING)
+        self.assertIsNone(record.error_message)
+        self.assertTrue(registry.finish("profile", record.generation, process, 15))
+        self.assertEqual(record.state, ProcessState.STOPPED)
+        self.assertIsNone(record.error_message)
+
+    def test_requested_stop_after_force_kill_is_stopped(self):
+        registry = ProcessRegistry()
+        process = FakeProcess()
+        record = registry.start("profile", process)
+        registry.set_running("profile", record.generation, process, 7)
+        self.assertTrue(registry.request_stop("profile", record.generation, process))
+        self.assertTrue(registry.request_force_kill("profile", record.generation, process))
+        self.assertTrue(registry.finish("profile", record.generation, process, 9))
+        self.assertEqual(record.state, ProcessState.STOPPED)
+
     def test_final_message_is_emitted_once_and_is_not_stdout(self):
         registry = ProcessRegistry()
         process = FakeProcess()
