@@ -6,6 +6,7 @@ from unittest.mock import patch
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 import pipewire_launcher.__main__ as launcher
+from pipewire_launcher.application_detection import ApplicationCandidate
 from pipewire_launcher.core import Profile
 from pipewire_launcher.pipewire_discovery import (
     DiscoveryState,
@@ -152,6 +153,10 @@ class FakeMessageBox:
     def critical(*_args, **_kwargs):
         pass
 
+    @staticmethod
+    def information(*_args, **_kwargs):
+        pass
+
 
 class FakeCloseEvent:
     def __init__(self):
@@ -277,6 +282,53 @@ class MainWindowQtTests(unittest.TestCase):
         self.assertEqual(self.window.current_id, "profile-one")
         self.assertEqual(self.window.selected_profile().name, "One")
         self.assertIn("State: stopped", self.window.process_info.text())
+
+    def test_detection_dialog_selects_nothing_by_default(self):
+        candidate = ApplicationCandidate(
+            desktop_id="ardour.desktop",
+            name="Ardour",
+            executable="/usr/bin/ardour",
+        )
+        with patch.object(
+            launcher.QDialog,
+            "exec",
+            return_value=launcher.QDialog.Accepted,
+        ):
+            selected = launcher.select_application_candidates(
+                self.window,
+                (candidate,),
+            )
+        self.assertEqual(selected, ())
+
+    def test_detect_apps_adds_only_explicitly_selected_candidate(self):
+        candidate = ApplicationCandidate(
+            desktop_id="audacity.desktop",
+            name="Audacity",
+            executable="/usr/bin/audacity",
+            environment=(("GDK_BACKEND", "x11"),),
+        )
+        with (
+            patch.object(
+                launcher,
+                "detect_jack_applications",
+                return_value=(candidate,),
+            ),
+            patch.object(
+                launcher,
+                "select_application_candidates",
+                return_value=(candidate,),
+            ),
+        ):
+            added = self.window.detect_applications()
+
+        self.assertEqual(added, 1)
+        self.assertEqual(len(self.window.profiles), 3)
+        self.assertEqual(self.window.selected_profile().name, "Audacity")
+        self.assertEqual(
+            self.window.selected_profile().environment,
+            {"GDK_BACKEND": "x11"},
+        )
+        self.assertEqual(len(self.window.store.profiles), 3)
 
     def test_run_started_pid_and_duplicate_guard(self):
         record = self.run_selected()

@@ -15,12 +15,18 @@ import time
 from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Qt
 from PySide6.QtGui import QAction, QFontDatabase
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
-    QLineEdit, QListWidget, QMainWindow, QMessageBox, QPlainTextEdit,
+    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QMessageBox, QPlainTextEdit,
     QPushButton, QSplitter, QStatusBar, QToolBar, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
 
+from pipewire_launcher.application_detection import (
+    ApplicationCandidate,
+    detect_jack_applications,
+    profiles_from_candidates,
+)
 from pipewire_launcher.core import Profile, ProfileStore, command_parts, command_preview, parse_arguments, parse_environment, validate_profile
 from pipewire_launcher.process_supervision import ProcessExecution, ProcessRegistry, ProcessState, ProcessTerminator
 from pipewire_launcher.pipewire_discovery_runner import (
@@ -29,6 +35,46 @@ from pipewire_launcher.pipewire_discovery_runner import (
     PipeWireDumpResult,
     RunnerState,
 )
+
+
+def select_application_candidates(
+    parent: QWidget,
+    candidates: tuple[ApplicationCandidate, ...],
+) -> tuple[ApplicationCandidate, ...]:
+    """Ask the user which detected applications should become profiles."""
+
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Detected JACK applications")
+    layout = QVBoxLayout(dialog)
+    layout.addWidget(QLabel(
+        "Select applications to add as profiles. Nothing is selected by default."
+    ))
+    choices = QListWidget(dialog)
+    for candidate in candidates:
+        item = QListWidgetItem(
+            f"{candidate.name} — {candidate.executable}",
+            choices,
+        )
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Unchecked)
+        item.setData(Qt.UserRole, candidate)
+    layout.addWidget(choices)
+
+    buttons = QDialogButtonBox(
+        QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+        parent=dialog,
+    )
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+
+    if dialog.exec() != QDialog.Accepted:
+        return ()
+    return tuple(
+        choices.item(index).data(Qt.UserRole)
+        for index in range(choices.count())
+        if choices.item(index).checkState() == Qt.Checked
+    )
 
 
 class MainWindow(QMainWindow):
@@ -61,6 +107,8 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         for text, slot in (("Import", self.import_profiles), ("Export", self.export_profiles)):
             action = QAction(text, self); action.triggered.connect(slot); toolbar.addAction(action)
+        toolbar.addSeparator()
+        action = QAction("Detect Apps", self); action.triggered.connect(self.detect_applications); toolbar.addAction(action)
 
         self.search = QLineEdit(); self.search.setPlaceholderText("Search profiles…"); self.search.textChanged.connect(self.refresh_list)
         self.list = QListWidget(); self.list.currentItemChanged.connect(self.select_item)
@@ -261,6 +309,53 @@ class MainWindow(QMainWindow):
         self.profiles = [x for x in self.profiles if x.id != p.id]; self.current_id = None; self.store.save(self.profiles); self.refresh_list();
         if self.profiles: self.list.setCurrentRow(0)
         else: self.new_profile()
+
+    def detect_applications(self):
+        try:
+            candidates = detect_jack_applications()
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Detection failed",
+                f"Could not inspect desktop applications:\n{exc}",
+            )
+            return 0
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "Detect applications",
+                "No supported JACK applications were detected.",
+            )
+            return 0
+
+        selected = select_application_candidates(self, candidates)
+        if not selected:
+            return 0
+        new_profiles = profiles_from_candidates(selected, self.profiles)
+        if not new_profiles:
+            QMessageBox.information(
+                self,
+                "Detect applications",
+                "The selected applications already have profiles.",
+            )
+            return 0
+
+        previous_profiles = list(self.profiles)
+        self.profiles.extend(new_profiles)
+        try:
+            self.store.save(self.profiles)
+        except Exception as exc:
+            self.profiles = previous_profiles
+            QMessageBox.critical(self, "Save failed", str(exc))
+            return 0
+
+        self.current_id = new_profiles[0].id
+        self.refresh_list()
+        self.statusBar().showMessage(
+            f"Added {len(new_profiles)} detected profile(s)",
+            5000,
+        )
+        return len(new_profiles)
 
     def browse_executable(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select application executable", "/usr/bin")

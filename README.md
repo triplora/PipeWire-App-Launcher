@@ -16,6 +16,9 @@ portable AppImage.
 - Create, edit, duplicate, delete, enable, and search application profiles.
 - Select an executable with the native file picker.
 - Build the exact `pw-jack -- application arguments...` invocation.
+- Detect a conservative catalog of installed JACK-capable applications from
+  XDG desktop entries without executing them.
+- Add only the detected applications explicitly selected by the user.
 - Configure working directory and environment variables per profile.
 - Start and stop applications without invoking a shell.
 - Persistent JSON configuration in
