@@ -12,10 +12,15 @@ and the project follows [Semantic Versioning](https://semver.org/).
 - Add Dependabot coverage for Python dependencies and GitHub Actions.
 - Add controlled Issue routing with blank Issues disabled.
 - Add regression tests for public project hygiene.
+- Detect installed JACK-capable applications from XDG desktop entries without
+  executing their commands.
+- Let users explicitly select detected applications before atomically saving
+  new profiles.
+- Preserve safe desktop-entry environment assignments and remove supported
+  freedesktop field codes.
 
 ### Planned
 
-- Detect installed JACK-capable applications.
 - Display PipeWire and JACK compatibility health.
 - Add starter profiles for common Linux audio applications.
 
