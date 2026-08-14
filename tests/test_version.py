@@ -18,7 +18,7 @@ class VersionTests(unittest.TestCase):
         match = re.search(r'^version = "([^"]+)"$', pyproject, re.MULTILINE)
 
         self.assertIsNotNone(match)
-        self.assertEqual(__version__, "0.1.3")
+        self.assertEqual(__version__, "0.1.4")
         self.assertEqual(match.group(1), __version__)
 
     def test_version_command_is_headless_and_exact(self):
@@ -42,5 +42,5 @@ class VersionTests(unittest.TestCase):
             self.assertFalse(config_dir.exists())
 
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.rstrip("\n"), "PipeWire App Launcher 0.1.3")
+        self.assertEqual(result.stdout.rstrip("\n"), "PipeWire App Launcher 0.1.4")
         self.assertEqual(result.stderr, "")

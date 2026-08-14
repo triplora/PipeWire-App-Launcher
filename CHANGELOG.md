@@ -6,6 +6,13 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Planned
+
+- Display PipeWire and JACK compatibility health.
+- Add starter profiles for common Linux audio applications.
+
+## [0.1.4] - 2026-08-14
+
 ### Added
 
 - Add a project Code of Conduct and support policy.
@@ -18,11 +25,6 @@ and the project follows [Semantic Versioning](https://semver.org/).
   new profiles.
 - Preserve safe desktop-entry environment assignments and remove supported
   freedesktop field codes.
-
-### Planned
-
-- Display PipeWire and JACK compatibility health.
-- Add starter profiles for common Linux audio applications.
 
 ## [0.1.3] - 2026-08-13
 
@@ -101,7 +103,8 @@ and the project follows [Semantic Versioning](https://semver.org/).
 - Profile import/export, process output, and start/stop controls.
 - Reproducible AppImage build script and core unit tests.
 
-[Unreleased]: https://github.com/triplora/PipeWire-App-Launcher/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/triplora/PipeWire-App-Launcher/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/triplora/PipeWire-App-Launcher/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/triplora/PipeWire-App-Launcher/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/triplora/PipeWire-App-Launcher/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/triplora/PipeWire-App-Launcher/releases/tag/v0.1.1
