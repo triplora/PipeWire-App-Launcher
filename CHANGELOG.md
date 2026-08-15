@@ -12,6 +12,9 @@ and the project follows [Semantic Versioning](https://semver.org/).
   `Categories` (Audio, AudioVideo, Music, MIDI) or known audio executables.
 - Add an "Audio Apps" tab with per-application enable toggles persisted to
   `audio_applications.json` and supervised Start/Stop through `pw-jack`.
+- Check PipeWire health before opening the launcher and offer to start the
+  `pipewire`, `pipewire-pulse`, and `wireplumber` user units when it is not
+  running.
 
 ### Planned
 

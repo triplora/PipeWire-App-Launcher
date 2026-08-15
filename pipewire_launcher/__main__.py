@@ -31,6 +31,7 @@ from pipewire_launcher.audio_applications import AudioApplicationManager
 from pipewire_launcher.audio_panel import AudioApplicationsPanel
 from pipewire_launcher.core import Profile, ProfileStore, command_parts, command_preview, parse_arguments, parse_environment, validate_profile
 from pipewire_launcher.process_supervision import ProcessExecution, ProcessRegistry, ProcessState, ProcessTerminator
+from pipewire_launcher.pipewire_health import PipeWireHealthCheck
 from pipewire_launcher.pipewire_discovery_runner import (
     PipeWireDiscoveryFailure,
     PipeWireDiscoveryRunner,
@@ -576,7 +577,11 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv); app.setApplicationName("PipeWire App Launcher"); app.setOrganizationName("R. Brothers Studio"); window = MainWindow(); window.show(); return app.exec()
+    app = QApplication(sys.argv); app.setApplicationName("PipeWire App Launcher"); app.setOrganizationName("R. Brothers Studio")
+    health_check = PipeWireHealthCheck()
+    if not health_check.check():
+        return 0
+    window = MainWindow(); window.show(); return app.exec()
 
 
 if __name__ == "__main__": raise SystemExit(main())

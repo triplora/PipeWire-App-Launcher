@@ -30,6 +30,8 @@ portable AppImage.
   `~/.config/pipewire-app-launcher/profiles.json`.
 - Import/export profile collections and automatic atomic saves.
 - Runtime checks for PipeWire, `pw-jack`, and the selected executable.
+- Startup PipeWire health check that offers to start the `pipewire`,
+  `pipewire-pulse`, and `wireplumber` user units when the server is down.
 - Process log and status indicator.
 - Independent per-profile process supervision and bounded logs.
 - Explicit lifecycle status, PID, and timestamps.
@@ -133,6 +135,20 @@ chmod +x "$output_dir/PipeWire-App-Launcher-x86_64.AppImage"
 
 `pw-jack` and a running PipeWire session remain host dependencies; audio
 applications need the user's live session bus and audio sockets.
+
+## PipeWire health check
+
+Before opening the main window the launcher verifies that the PipeWire server is
+running, checking the per-user systemd unit (`systemctl --user is-active
+pipewire`) and falling back to process/socket probes when no user bus is
+available. If the server is down it asks:
+
+> O servidor de áudio PipeWire não está rodando. Deseja iniciá-lo agora?
+
+Answering "Sim" starts `pipewire`, `pipewire-pulse`, and `wireplumber` through
+`systemctl --user start` in the background and waits briefly for the server to
+come up. Answering "Não" (or a failed startup) closes the launcher with a
+warning instead of opening a broken session.
 
 ## First profile: Ardour
 
