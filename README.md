@@ -19,6 +19,11 @@ portable AppImage.
 - Detect a conservative catalog of installed JACK-capable applications from
   XDG desktop entries without executing them.
 - Add only the detected applications explicitly selected by the user.
+- List installed audio applications from XDG desktop entries matching
+  audio-related categories (`Audio`, `AudioVideo`, `Music`, MIDI) or known
+  audio executables.
+- Enable/disable each detected audio application with an inline toggle and
+  start/stop it through `pw-jack` from a dedicated "Audio Apps" tab.
 - Configure working directory and environment variables per profile.
 - Start and stop applications without invoking a shell.
 - Persistent JSON configuration in
@@ -157,6 +162,22 @@ The preview is a display-safe rendering. At execution time the program calls
 `QProcess.start("pw-jack", ["--", executable, ...])` directly. It never passes
 the profile through `/bin/sh`, so shell operators in arguments or environment
 values are not evaluated.
+
+## Audio Applications tab
+
+The "Audio Apps" tab scans XDG application directories (for example
+`/usr/share/applications`) for desktop entries whose `Categories` include
+audio-related values or whose executable is a known audio application. The list
+is populated automatically at startup and can be refreshed with
+"Scan for audio apps".
+
+Each row has an enabled toggle and status; checking/unchecking persists to
+`~/.config/pipewire-app-launcher/audio_applications.json`. "Start selected"
+launches the application through the `pw-jack` wrapper and "Stop selected"
+stops it with the same supervised graceful-stop/forced-kill fallback used by
+profiles.
+
+The panel never executes anything while scanning; detection is parsing-only.
 
 ## Contributing, support and security
 

@@ -18,8 +18,8 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QPlainTextEdit,
-    QPushButton, QSplitter, QStatusBar, QToolBar, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QPushButton, QSplitter, QStatusBar, QTabWidget, QToolBar, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from pipewire_launcher.application_detection import (
@@ -27,6 +27,8 @@ from pipewire_launcher.application_detection import (
     detect_jack_applications,
     profiles_from_candidates,
 )
+from pipewire_launcher.audio_applications import AudioApplicationManager
+from pipewire_launcher.audio_panel import AudioApplicationsPanel
 from pipewire_launcher.core import Profile, ProfileStore, command_parts, command_preview, parse_arguments, parse_environment, validate_profile
 from pipewire_launcher.process_supervision import ProcessExecution, ProcessRegistry, ProcessState, ProcessTerminator
 from pipewire_launcher.pipewire_discovery_runner import (
@@ -95,6 +97,7 @@ class MainWindow(QMainWindow):
         self._closing_started = False
         self._discovery_request_id: str | None = None
         self.discovery_runner = PipeWireDiscoveryRunner(self)
+        self.audio_manager = AudioApplicationManager()
         self._build_ui()
         self._connect_discovery_signals()
         self._load()
@@ -139,7 +142,16 @@ class MainWindow(QMainWindow):
         self.discovery_tree = QTreeWidget(); self.discovery_tree.setHeaderLabels(["Name", "Type", "Application", "PID", "Media class", "ID"]); self.discovery_tree.setRootIsDecorated(True); self.discovery_tree.setUniformRowHeights(True)
         discovery_buttons = QHBoxLayout(); discovery_buttons.addWidget(self.discovery_refresh_button); discovery_buttons.addWidget(self.discovery_cancel_button); discovery_buttons.addStretch()
         right = QWidget(); rv = QVBoxLayout(right); rv.addLayout(form); rv.addLayout(buttons); rv.addWidget(self.process_info); rv.addWidget(QLabel("Process output")); rv.addWidget(self.log, 1); rv.addWidget(QLabel("PipeWire Discovery")); rv.addLayout(discovery_buttons); rv.addWidget(self.discovery_state); rv.addWidget(self.discovery_tree)
-        split = QSplitter(); split.addWidget(left); split.addWidget(right); split.setSizes([280, 800]); self.setCentralWidget(split)
+        split = QSplitter(); split.addWidget(left); split.addWidget(right); split.setSizes([280, 800])
+        tabs = QTabWidget(); tabs.addTab(split, "Profiles")
+        self.audio_panel = AudioApplicationsPanel(
+            self.audio_manager,
+            self.registry,
+            self.terminator,
+            parent=self,
+        )
+        tabs.addTab(self.audio_panel, "Audio Apps")
+        self.setCentralWidget(tabs)
         self.setStatusBar(QStatusBar()); self.statusBar().showMessage("Ready")
         self._update_discovery_controls()
 
@@ -257,6 +269,7 @@ class MainWindow(QMainWindow):
     def _load(self):
         try: self.profiles = self.store.load()
         except Exception as exc: QMessageBox.warning(self, "Profiles", f"Could not load profiles:\n{exc}")
+        self.audio_panel.refresh()
         self.refresh_list();
         if not self.profiles:
             self.new_profile()
@@ -505,6 +518,7 @@ class MainWindow(QMainWindow):
             if not self._closing_started:
                 self._closing_started = True
                 self.discovery_runner.shutdown()
+                self.audio_panel.shutdown()
             event.accept(); return
         if not self.close_requested:
             answer = QMessageBox.question(self, "Processes running", "Stop all running processes before closing?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
@@ -513,6 +527,7 @@ class MainWindow(QMainWindow):
             self.close_requested = True
             self._closing_started = True
             self.discovery_runner.shutdown()
+            self.audio_panel.shutdown()
             for record in active:
                 if self.registry.request_stop(record.profile_id, record.generation, record.process):
                     self.terminator.graceful(record.process)

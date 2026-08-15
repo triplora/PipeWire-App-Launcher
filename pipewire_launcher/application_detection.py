@@ -1,4 +1,10 @@
-"""Conservative, execution-free discovery of installed JACK applications."""
+"""Execution-free discovery of installed desktop applications.
+
+Desktop entries are parsed without running their commands. Callers can filter
+candidates through a predicate; ``detect_jack_applications`` keeps only known
+JACK-capable applications while other callers (such as the audio application
+panel) use their own audio-focused predicate.
+"""
 
 from __future__ import annotations
 
@@ -37,13 +43,14 @@ _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 @dataclass(frozen=True)
 class ApplicationCandidate:
-    """One safely resolved JACK-capable desktop application."""
+    """One safely resolved desktop application."""
 
     desktop_id: str
     name: str
     executable: str
     arguments: tuple[str, ...] = ()
     environment: tuple[tuple[str, str], ...] = ()
+    categories: tuple[str, ...] = ()
     source: str = ""
 
     def profile_key(self) -> tuple[str, tuple[str, ...]]:
@@ -234,7 +241,13 @@ def _is_known_jack_application(
     return False
 
 
-def parse_application_candidate(
+def _parse_categories(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(part.strip() for part in value.split(";") if part.strip())
+
+
+def parse_desktop_candidate(
     path: Path,
     directory: Path,
     *,
@@ -263,28 +276,49 @@ def parse_application_candidate(
     if parsed is None:
         return None
     executable, arguments, environment = parsed
-    desktop_id = _desktop_id(path, directory)
-
-    if not _is_known_jack_application(desktop_id, executable, arguments):
-        return None
 
     return ApplicationCandidate(
-        desktop_id=desktop_id,
+        desktop_id=_desktop_id(path, directory),
         name=name,
         executable=executable,
         arguments=arguments,
         environment=environment,
+        categories=_parse_categories(values.get("Categories")),
         source=str(path),
     )
 
 
-def detect_jack_applications(
+def parse_application_candidate(
+    path: Path,
+    directory: Path,
+    *,
+    resolver: Resolver = shutil.which,
+) -> ApplicationCandidate | None:
+    """Parse one desktop file, keeping only known JACK-capable applications."""
+
+    candidate = parse_desktop_candidate(path, directory, resolver=resolver)
+    if candidate is None:
+        return None
+    if not _is_known_jack_application(candidate.desktop_id, candidate.executable, candidate.arguments):
+        return None
+    return candidate
+
+
+CandidatePredicate = Callable[[ApplicationCandidate], bool]
+
+
+def scan_application_candidates(
     directories: Sequence[Path] | None = None,
     *,
     resolver: Resolver = shutil.which,
+    predicate: CandidatePredicate | None = None,
 ) -> tuple[ApplicationCandidate, ...]:
-    """Return deterministic, deduplicated candidates from desktop entries."""
+    """Return deterministic, deduplicated candidates passing the predicate.
 
+    When ``predicate`` is None every safely parseable application is returned.
+    """
+
+    accept = predicate if predicate is not None else lambda _candidate: True
     search_directories = (
         application_directories()
         if directories is None
@@ -309,12 +343,12 @@ def detect_jack_applications(
             # A higher-precedence hidden or invalid entry masks the lower one.
             seen_desktop_ids.add(desktop_id)
 
-            candidate = parse_application_candidate(
+            candidate = parse_desktop_candidate(
                 path,
                 directory,
                 resolver=resolver,
             )
-            if candidate is None:
+            if candidate is None or not accept(candidate):
                 continue
             key = candidate.profile_key()
             if key in seen_profiles:
@@ -332,6 +366,28 @@ def detect_jack_applications(
                 item.desktop_id,
             ),
         )
+    )
+
+
+def _is_jack_candidate(candidate: ApplicationCandidate) -> bool:
+    return _is_known_jack_application(
+        candidate.desktop_id,
+        candidate.executable,
+        candidate.arguments,
+    )
+
+
+def detect_jack_applications(
+    directories: Sequence[Path] | None = None,
+    *,
+    resolver: Resolver = shutil.which,
+) -> tuple[ApplicationCandidate, ...]:
+    """Return conservative, deduplicated JACK-capable application candidates."""
+
+    return scan_application_candidates(
+        directories,
+        resolver=resolver,
+        predicate=_is_jack_candidate,
     )
 
 

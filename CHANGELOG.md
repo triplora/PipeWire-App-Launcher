@@ -6,6 +6,13 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- List installed audio applications from XDG desktop entries by audio-related
+  `Categories` (Audio, AudioVideo, Music, MIDI) or known audio executables.
+- Add an "Audio Apps" tab with per-application enable toggles persisted to
+  `audio_applications.json` and supervised Start/Stop through `pw-jack`.
+
 ### Planned
 
 - Display PipeWire and JACK compatibility health.
