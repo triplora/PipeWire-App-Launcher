@@ -299,6 +299,51 @@ def restore_default_audio_links(
         time.sleep(poll_interval_ms / 1000.0)
 
 
+def qpwgraph_running(
+    *,
+    runner: CommandRunner = run_command,
+    resolver: Callable[[str], str | None] = shutil.which,
+) -> bool:
+    """Return whether a ``qpwgraph`` instance is currently running."""
+
+    if resolver("pgrep") is None:
+        return False
+    return runner(["pgrep", "-x", "qpwgraph"]).returncode == 0
+
+
+def restart_qpwgraph(
+    *,
+    runner: CommandRunner = run_command,
+    resolver: Callable[[str], str | None] = shutil.which,
+    popen: Callable[..., Any] = subprocess.Popen,
+) -> bool:
+    """Restart qpwgraph so it registers a fresh system tray icon.
+
+    When the PipeWire sockets go down and come back up, a leftover qpwgraph
+    keeps a stale connection and never re-registers its Ubuntu tray icon.
+    Force-close any running instance and launch a clean one in the background.
+    Returns whether the fresh instance was launched.
+    """
+
+    if (
+        qpwgraph_running(runner=runner, resolver=resolver)
+        and resolver("killall") is not None
+    ):
+        runner(["killall", "-9", "qpwgraph"])
+    if resolver("qpwgraph") is None:
+        return False
+    try:
+        popen(
+            ["qpwgraph"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return False
+    return True
+
+
 class PipeWireHealthCheck:
     """Ask the user about a missing PipeWire server and start it when asked."""
 
@@ -312,6 +357,7 @@ class PipeWireHealthCheck:
         poll_interval_ms: int = 250,
         start_timeout_ms: int = 8000,
         link_restorer: Callable[..., int] = restore_default_audio_links,
+        qpwgraph_restarter: Callable[..., bool] = restart_qpwgraph,
     ) -> None:
         self._runner = runner
         self._resolver = resolver
@@ -320,6 +366,7 @@ class PipeWireHealthCheck:
         self._poll_interval_ms = poll_interval_ms
         self._start_timeout_ms = start_timeout_ms
         self._link_restorer = link_restorer
+        self._qpwgraph_restarter = qpwgraph_restarter
 
     def running(self) -> bool:
         return pipewire_running(runner=self._runner, resolver=self._resolver)
@@ -339,12 +386,22 @@ class PipeWireHealthCheck:
         if not self._wait_until_running():
             return self._abort_start_failed(parent)
         self._restore_default_links()
+        self._restart_qpwgraph()
         return True
 
     def _restore_default_links(self) -> int:
         """Reconnect app streams to the hardware outputs after startup."""
 
         return self._link_restorer(runner=self._runner, resolver=self._resolver)
+
+    def _restart_qpwgraph(self) -> bool:
+        """Restart qpwgraph so it re-registers its system tray icon."""
+
+        return self._qpwgraph_restarter(
+            runner=self._runner,
+            resolver=self._resolver,
+            popen=self._popen,
+        )
 
     def _ask_to_start(self, parent: QWidget | None) -> bool:
         answer = self._message_box.question(

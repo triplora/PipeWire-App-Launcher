@@ -17,6 +17,8 @@ from pipewire_launcher.pipewire_health import (
     _playback_targets,
     pipewire_process_running,
     pipewire_running,
+    qpwgraph_running,
+    restart_qpwgraph,
     restore_default_audio_links,
     run_command,
     start_pipewire_services,
@@ -189,7 +191,7 @@ class StartPipeWireServicesTests(unittest.TestCase):
 
 
 class PipeWireHealthCheckTests(unittest.TestCase):
-    def coordinator(self, runner, message_box, popen=None, link_restorer=None):
+    def coordinator(self, runner, message_box, popen=None, link_restorer=None, qpwgraph_restarter=None):
         kwargs = dict(
             runner=runner,
             resolver=resolver,
@@ -200,6 +202,8 @@ class PipeWireHealthCheckTests(unittest.TestCase):
         )
         if link_restorer is not None:
             kwargs["link_restorer"] = link_restorer
+        if qpwgraph_restarter is not None:
+            kwargs["qpwgraph_restarter"] = qpwgraph_restarter
         return PipeWireHealthCheck(**kwargs)
 
     def test_returns_true_without_dialog_when_running(self):
@@ -281,6 +285,42 @@ class PipeWireHealthCheckTests(unittest.TestCase):
         self.assertFalse(check.check())
         self.assertEqual(restorer.calls, [])
 
+    def test_yes_restarts_qpwgraph_after_start(self):
+        runner = FakeRunner(
+            becomes_active_after_start=True,
+            process_after_start=True,
+        )
+        message_box = FakeMessageBox(question_answer=QMessageBox.Yes)
+        popen = FakePopen(on_start=lambda: setattr(runner, "started", True))
+        restarter = RecordingRestarter()
+        check = self.coordinator(runner, message_box, popen, qpwgraph_restarter=restarter)
+        self.assertTrue(check.check())
+        self.assertEqual(len(restarter.calls), 1)
+
+    def test_running_skips_qpwgraph_restart(self):
+        runner = FakeRunner(initially_active=True)
+        message_box = FakeMessageBox()
+        restarter = RecordingRestarter()
+        check = self.coordinator(runner, message_box, qpwgraph_restarter=restarter)
+        self.assertTrue(check.check())
+        self.assertEqual(restarter.calls, [])
+
+    def test_declined_start_skips_qpwgraph_restart(self):
+        runner = FakeRunner()
+        message_box = FakeMessageBox(question_answer=QMessageBox.No)
+        restarter = RecordingRestarter()
+        check = self.coordinator(runner, message_box, qpwgraph_restarter=restarter)
+        self.assertFalse(check.check())
+        self.assertEqual(restarter.calls, [])
+
+    def test_start_failure_skips_qpwgraph_restart(self):
+        runner = FakeRunner()
+        message_box = FakeMessageBox(question_answer=QMessageBox.Yes)
+        restarter = RecordingRestarter()
+        check = self.coordinator(runner, message_box, qpwgraph_restarter=restarter)
+        self.assertFalse(check.check())
+        self.assertEqual(restarter.calls, [])
+
 
 INPUT_PORTS = """Midi-Bridge:Midi Through:(playback_0) Midi Through Port-0
 alsa_output.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-stereo:playback_FL
@@ -318,6 +358,38 @@ class RecordingRestorer:
     def __call__(self, *, runner, resolver):
         self.calls.append((runner, resolver))
         return 3
+
+
+class RecordingRestarter:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *, runner, resolver, popen):
+        self.calls.append((runner, resolver, popen))
+        return True
+
+
+class FakeQpwgraphRunner:
+    """Serves ``pgrep`` / ``killall`` answers for qpwgraph."""
+
+    def __init__(self, qpwgraph_present=True):
+        self.qpwgraph_present = qpwgraph_present
+        self.calls = []
+
+    def __call__(self, arguments):
+        arguments = tuple(arguments)
+        self.calls.append(arguments)
+        if list(arguments) == ["pgrep", "-x", "qpwgraph"]:
+            return CommandResult(0 if self.qpwgraph_present else 1, "", "")
+        if list(arguments) == ["killall", "-9", "qpwgraph"]:
+            return CommandResult(0, "", "")
+        return CommandResult(0, "", "")
+
+
+def qpwgraph_resolver(name):
+    if name in {"pgrep", "killall", "qpwgraph"}:
+        return f"/usr/bin/{name}"
+    return None
 
 
 class FakeLinkRunner:
@@ -532,6 +604,78 @@ class RestoreDefaultAudioLinksTests(unittest.TestCase):
             ("pw-link", "alsa_playback.firefox:output_FL", PCI_PLAYBACK_FL),
             ("pw-link", "alsa_playback.firefox:output_FR", PCI_PLAYBACK_FR),
         ])
+
+
+class QpwgraphRunningTests(unittest.TestCase):
+    def test_running_instance_is_detected(self):
+        runner = FakeQpwgraphRunner(qpwgraph_present=True)
+        self.assertTrue(
+            qpwgraph_running(runner=runner, resolver=qpwgraph_resolver)
+        )
+
+    def test_no_instance_is_not_running(self):
+        runner = FakeQpwgraphRunner(qpwgraph_present=False)
+        self.assertFalse(
+            qpwgraph_running(runner=runner, resolver=qpwgraph_resolver)
+        )
+
+    def test_missing_pgrep_is_not_running(self):
+        runner = FakeQpwgraphRunner(qpwgraph_present=True)
+        self.assertFalse(
+            qpwgraph_running(runner=runner, resolver=lambda name: None)
+        )
+
+
+class RestartQpwgraphTests(unittest.TestCase):
+    def test_kills_running_instance_and_launches_fresh(self):
+        runner = FakeQpwgraphRunner(qpwgraph_present=True)
+        popen = FakePopen()
+        started = restart_qpwgraph(
+            runner=runner,
+            resolver=qpwgraph_resolver,
+            popen=popen,
+        )
+        self.assertTrue(started)
+        self.assertIn(("killall", "-9", "qpwgraph"), runner.calls)
+        self.assertEqual(popen.calls[0][0], ("qpwgraph",))
+        self.assertTrue(popen.calls[0][1]["start_new_session"])
+
+    def test_launches_fresh_without_running_instance(self):
+        runner = FakeQpwgraphRunner(qpwgraph_present=False)
+        popen = FakePopen()
+        started = restart_qpwgraph(
+            runner=runner,
+            resolver=qpwgraph_resolver,
+            popen=popen,
+        )
+        self.assertTrue(started)
+        self.assertNotIn(("killall", "-9", "qpwgraph"), runner.calls)
+        self.assertEqual(len(popen.calls), 1)
+
+    def test_missing_qpwgraph_binary_returns_false(self):
+        runner = FakeQpwgraphRunner()
+        popen = FakePopen()
+        started = restart_qpwgraph(
+            runner=runner,
+            resolver=lambda name: None,
+            popen=popen,
+        )
+        self.assertFalse(started)
+        self.assertEqual(popen.calls, [])
+
+    def test_popen_failure_returns_false(self):
+        runner = FakeQpwgraphRunner(qpwgraph_present=True)
+
+        def failing_popen(*_args, **_kwargs):
+            raise OSError("boom")
+
+        started = restart_qpwgraph(
+            runner=runner,
+            resolver=qpwgraph_resolver,
+            popen=failing_popen,
+        )
+        self.assertFalse(started)
+        self.assertIn(("killall", "-9", "qpwgraph"), runner.calls)
 
 
 if __name__ == "__main__":
