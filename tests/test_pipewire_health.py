@@ -10,8 +10,14 @@ from PySide6.QtWidgets import QMessageBox
 from pipewire_launcher.pipewire_health import (
     CommandResult,
     PipeWireHealthCheck,
+    _channel_token,
+    _link_outputs_to_playback,
+    _missing_playback_candidates,
+    _parse_link_listing,
+    _playback_targets,
     pipewire_process_running,
     pipewire_running,
+    restore_default_audio_links,
     run_command,
     start_pipewire_services,
     systemd_unit_active,
@@ -183,8 +189,8 @@ class StartPipeWireServicesTests(unittest.TestCase):
 
 
 class PipeWireHealthCheckTests(unittest.TestCase):
-    def coordinator(self, runner, message_box, popen=None):
-        return PipeWireHealthCheck(
+    def coordinator(self, runner, message_box, popen=None, link_restorer=None):
+        kwargs = dict(
             runner=runner,
             resolver=resolver,
             popen=popen or FakePopen(),
@@ -192,6 +198,9 @@ class PipeWireHealthCheckTests(unittest.TestCase):
             poll_interval_ms=5,
             start_timeout_ms=50,
         )
+        if link_restorer is not None:
+            kwargs["link_restorer"] = link_restorer
+        return PipeWireHealthCheck(**kwargs)
 
     def test_returns_true_without_dialog_when_running(self):
         runner = FakeRunner(initially_active=True)
@@ -233,6 +242,296 @@ class PipeWireHealthCheckTests(unittest.TestCase):
             message_box.question_calls[0][1],
             "O servidor de áudio PipeWire não está rodando. Deseja iniciá-lo agora?",
         )
+
+    def test_yes_starts_services_restores_links_and_proceeds(self):
+        runner = FakeRunner(
+            becomes_active_after_start=True,
+            process_after_start=True,
+        )
+        message_box = FakeMessageBox(question_answer=QMessageBox.Yes)
+        popen = FakePopen(on_start=lambda: setattr(runner, "started", True))
+        restorer = RecordingRestorer()
+        check = self.coordinator(runner, message_box, popen, restorer)
+        self.assertTrue(check.check())
+        self.assertTrue(runner.started)
+        self.assertEqual(len(restorer.calls), 1)
+        self.assertEqual(message_box.warning_calls, [])
+
+    def test_running_skips_link_restore(self):
+        runner = FakeRunner(initially_active=True)
+        message_box = FakeMessageBox()
+        restorer = RecordingRestorer()
+        check = self.coordinator(runner, message_box, link_restorer=restorer)
+        self.assertTrue(check.check())
+        self.assertEqual(restorer.calls, [])
+
+    def test_declined_start_skips_link_restore(self):
+        runner = FakeRunner()
+        message_box = FakeMessageBox(question_answer=QMessageBox.No)
+        restorer = RecordingRestorer()
+        check = self.coordinator(runner, message_box, link_restorer=restorer)
+        self.assertFalse(check.check())
+        self.assertEqual(restorer.calls, [])
+
+    def test_start_failure_skips_link_restore(self):
+        runner = FakeRunner()
+        message_box = FakeMessageBox(question_answer=QMessageBox.Yes)
+        restorer = RecordingRestorer()
+        check = self.coordinator(runner, message_box, link_restorer=restorer)
+        self.assertFalse(check.check())
+        self.assertEqual(restorer.calls, [])
+
+
+INPUT_PORTS = """Midi-Bridge:Midi Through:(playback_0) Midi Through Port-0
+alsa_output.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-stereo:playback_FL
+alsa_output.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-stereo:playback_FR
+alsa_output.pci-0000_0e_00.4.analog-stereo:playback_FL
+  |<- alsa_playback.speaker-test:output_FL
+alsa_output.pci-0000_0e_00.4.analog-stereo:playback_FR
+  |<- alsa_playback.speaker-test:output_FR
+"""
+
+OUTPUT_PORTS = """Midi-Bridge:Midi Through:(capture_0) Midi Through Port-0
+alsa_output.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-stereo:monitor_FL
+alsa_output.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-stereo:monitor_FR
+alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.mono-fallback:capture_MONO
+alsa_output.pci-0000_0e_00.4.analog-stereo:monitor_FL
+alsa_output.pci-0000_0e_00.4.analog-stereo:monitor_FR
+alsa_input.pci-0000_0e_00.4.analog-stereo:capture_FL
+alsa_input.pci-0000_0e_00.4.analog-stereo:capture_FR
+alsa_playback.firefox:output_FL
+alsa_playback.firefox:output_FR
+alsa_playback.speaker-test:output_FL
+  |-> alsa_output.pci-0000_0e_00.4.analog-stereo:playback_FL
+alsa_playback.speaker-test:output_FR
+  |-> alsa_output.pci-0000_0e_00.4.analog-stereo:playback_FR
+"""
+
+PCI_PLAYBACK_FL = "alsa_output.pci-0000_0e_00.4.analog-stereo:playback_FL"
+PCI_PLAYBACK_FR = "alsa_output.pci-0000_0e_00.4.analog-stereo:playback_FR"
+
+
+class RecordingRestorer:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *, runner, resolver):
+        self.calls.append((runner, resolver))
+        return 3
+
+
+class FakeLinkRunner:
+    """Serves ``pw-link`` listings and records connect attempts."""
+
+    def __init__(self, inputs=INPUT_PORTS, outputs=OUTPUT_PORTS, link_rc=0):
+        self.inputs = inputs
+        self.outputs = outputs
+        self.link_rc = link_rc
+        self.calls = []
+        self.link_commands = []
+
+    def __call__(self, arguments):
+        arguments = tuple(arguments)
+        self.calls.append(arguments)
+        if arguments == ("pw-link", "-l", "-i"):
+            return CommandResult(0, self.inputs, "")
+        if arguments == ("pw-link", "-l", "-o"):
+            return CommandResult(0, self.outputs, "")
+        if arguments[0] == "pw-link":
+            self.link_commands.append(arguments)
+            return CommandResult(self.link_rc, "", "")
+        return CommandResult(0, "", "")
+
+
+class DelayedPlaybackRunner:
+    """Reports no playback ports for the first few input listings."""
+
+    def __init__(self, outputs=OUTPUT_PORTS, delay_calls=1):
+        self.outputs = outputs
+        self.delay_calls = delay_calls
+        self.input_calls = 0
+        self.link_commands = []
+
+    def __call__(self, arguments):
+        arguments = tuple(arguments)
+        if arguments == ("pw-link", "-l", "-i"):
+            self.input_calls += 1
+            if self.input_calls <= self.delay_calls:
+                return CommandResult(0, "", "")
+            return CommandResult(0, INPUT_PORTS, "")
+        if arguments == ("pw-link", "-l", "-o"):
+            return CommandResult(0, self.outputs, "")
+        if arguments[0] == "pw-link":
+            self.link_commands.append(arguments)
+            return CommandResult(0, "", "")
+        return CommandResult(0, "", "")
+
+
+def link_resolver(name):
+    return "/usr/bin/pw-link" if name == "pw-link" else None
+
+
+class LinkListingParsingTests(unittest.TestCase):
+    def test_ports_and_their_links_are_parsed(self):
+        ports = _parse_link_listing(OUTPUT_PORTS)
+        self.assertEqual(
+            ports["alsa_playback.speaker-test:output_FL"],
+            (PCI_PLAYBACK_FL,),
+        )
+        self.assertEqual(
+            ports["alsa_playback.firefox:output_FL"],
+            (),
+        )
+        self.assertEqual(
+            ports["alsa_input.pci-0000_0e_00.4.analog-stereo:capture_FL"],
+            (),
+        )
+
+    def test_input_listing_arrow_direction_is_parsed(self):
+        ports = _parse_link_listing(INPUT_PORTS)
+        self.assertEqual(
+            ports[PCI_PLAYBACK_FL],
+            ("alsa_playback.speaker-test:output_FL",),
+        )
+
+    def test_empty_and_blank_input(self):
+        self.assertEqual(_parse_link_listing(""), {})
+        self.assertEqual(_parse_link_listing("  \n\n \n"), {})
+
+
+class LinkTargetSelectionTests(unittest.TestCase):
+    def test_channel_token(self):
+        self.assertEqual(_channel_token("alsa_playback.x:output_FL"), "FL")
+        self.assertEqual(
+            _channel_token("alsa_output.usb:mono-fallback:playback_MONO"),
+            "MONO",
+        )
+
+    def test_candidates_only_include_unlinked_stream_outputs(self):
+        ports = _parse_link_listing(OUTPUT_PORTS)
+        candidates = _missing_playback_candidates(ports)
+        self.assertEqual(candidates, [
+            "alsa_playback.firefox:output_FL",
+            "alsa_playback.firefox:output_FR",
+        ])
+
+    def test_capture_streams_and_midi_are_never_candidates(self):
+        ports = _parse_link_listing(OUTPUT_PORTS + (
+            "alsa_capture.audacity:input_FL\n"
+            "alsa_capture.audacity:input_FR\n"
+        ))
+        candidates = _missing_playback_candidates(ports)
+        self.assertEqual(candidates, [
+            "alsa_playback.firefox:output_FL",
+            "alsa_playback.firefox:output_FR",
+        ])
+
+    def test_midi_playback_port_is_not_a_hardware_target(self):
+        targets = _playback_targets(_parse_link_listing(INPUT_PORTS))
+        self.assertNotIn("0) Midi Through Port-0", targets)
+
+    def test_targets_prefer_the_sink_with_most_links(self):
+        ports = _parse_link_listing(INPUT_PORTS)
+        targets = _playback_targets(ports)
+        self.assertEqual(targets, {"FL": PCI_PLAYBACK_FL, "FR": PCI_PLAYBACK_FR})
+
+    def test_targets_fall_back_to_first_sink_when_none_linked(self):
+        ports = _parse_link_listing(INPUT_PORTS.replace(
+            "  |<- alsa_playback.speaker-test:output_FL\n", ""
+        ).replace(
+            "  |<- alsa_playback.speaker-test:output_FR\n", ""
+        ))
+        targets = _playback_targets(ports)
+        self.assertEqual(targets, {
+            "FL": "alsa_output.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-stereo:playback_FL",
+            "FR": "alsa_output.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-stereo:playback_FR",
+        })
+
+
+class RestoreDefaultAudioLinksTests(unittest.TestCase):
+    def test_unlinked_streams_are_linked_to_the_active_sink(self):
+        runner = FakeLinkRunner()
+        created = restore_default_audio_links(
+            runner=runner,
+            resolver=link_resolver,
+            timeout_ms=100,
+            poll_interval_ms=5,
+        )
+        self.assertEqual(created, 2)
+        self.assertEqual(runner.link_commands, [
+            ("pw-link", "alsa_playback.firefox:output_FL", PCI_PLAYBACK_FL),
+            ("pw-link", "alsa_playback.firefox:output_FR", PCI_PLAYBACK_FR),
+        ])
+
+    def test_no_links_are_created_without_pw_link(self):
+        runner = FakeLinkRunner()
+        created = restore_default_audio_links(
+            runner=runner,
+            resolver=lambda name: None,
+            timeout_ms=100,
+            poll_interval_ms=5,
+        )
+        self.assertEqual(created, 0)
+        self.assertEqual(runner.link_commands, [])
+
+    def test_waits_for_playback_ports_to_appear(self):
+        runner = DelayedPlaybackRunner(delay_calls=1)
+        created = restore_default_audio_links(
+            runner=runner,
+            resolver=link_resolver,
+            timeout_ms=2000,
+            poll_interval_ms=5,
+        )
+        self.assertEqual(created, 2)
+        self.assertGreaterEqual(runner.input_calls, 2)
+        self.assertEqual(len(runner.link_commands), 2)
+
+    def test_gives_up_when_no_playback_ports_appear(self):
+        runner = DelayedPlaybackRunner(delay_calls=10**6)
+        created = restore_default_audio_links(
+            runner=runner,
+            resolver=link_resolver,
+            timeout_ms=40,
+            poll_interval_ms=5,
+        )
+        self.assertEqual(created, 0)
+        self.assertEqual(runner.link_commands, [])
+
+    def test_failed_links_are_not_counted(self):
+        runner = FakeLinkRunner(link_rc=1)
+        created = restore_default_audio_links(
+            runner=runner,
+            resolver=link_resolver,
+            timeout_ms=100,
+            poll_interval_ms=5,
+        )
+        self.assertEqual(created, 0)
+        self.assertEqual(len(runner.link_commands), 2)
+
+    def test_already_linked_streams_are_left_alone(self):
+        only_linked = OUTPUT_PORTS.replace(
+            "alsa_playback.firefox:output_FL\n", ""
+        ).replace("alsa_playback.firefox:output_FR\n", "")
+        runner = FakeLinkRunner(outputs=only_linked)
+        created = restore_default_audio_links(
+            runner=runner,
+            resolver=link_resolver,
+            timeout_ms=100,
+            poll_interval_ms=5,
+        )
+        self.assertEqual(created, 0)
+        self.assertEqual(runner.link_commands, [])
+
+    def test_link_outputs_to_playback_uses_target_selection(self):
+        runner = FakeLinkRunner()
+        outputs = _parse_link_listing(OUTPUT_PORTS)
+        inputs = _parse_link_listing(INPUT_PORTS)
+        created = _link_outputs_to_playback(runner, outputs, inputs)
+        self.assertEqual(created, 2)
+        self.assertEqual(runner.link_commands, [
+            ("pw-link", "alsa_playback.firefox:output_FL", PCI_PLAYBACK_FL),
+            ("pw-link", "alsa_playback.firefox:output_FR", PCI_PLAYBACK_FR),
+        ])
 
 
 if __name__ == "__main__":

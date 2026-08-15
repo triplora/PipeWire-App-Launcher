@@ -129,7 +129,13 @@ def start_pipewire_services(
     resolver: Callable[[str], str | None] = shutil.which,
     popen: Callable[..., Any] = subprocess.Popen,
 ) -> bool:
-    """Start the PipeWire user units in the background."""
+    """Start the full PipeWire user ecosystem in the background.
+
+    ``pipewire-pulse`` must be started explicitly so the PulseAudio
+    compatibility server (pulse-server module) comes up with PipeWire; without
+    it the system sound tray icon disappears. ``wireplumber`` provides the
+    session and routing policies.
+    """
 
     if resolver("systemctl") is None:
         return False
@@ -145,6 +151,154 @@ def start_pipewire_services(
     return True
 
 
+def _link_target(raw_line: str) -> str:
+    """Extract the remote port name from a ``pw-link`` arrow line."""
+
+    line = raw_line.strip()
+    for marker in ("|-> ", "|<- "):
+        if line.startswith(marker):
+            return line[len(marker):].strip()
+    return ""
+
+
+def _parse_link_listing(text: str) -> dict[str, tuple[str, ...]]:
+    """Parse ``pw-link -l`` output into ``{port name: linked port names}``.
+
+    Port names are plain lines; every indented ``|->`` / ``|<-`` line that
+    follows a port describes one link attached to it.
+    """
+
+    ports: dict[str, list[str]] = {}
+    current: str | None = None
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            continue
+        stripped = raw_line.strip()
+        if stripped.startswith(("|->", "|<-")):
+            target = _link_target(raw_line)
+            if current is not None and target:
+                ports[current].append(target)
+            continue
+        current = stripped
+        ports.setdefault(current, [])
+    return {name: tuple(links) for name, links in ports.items()}
+
+
+def _pw_link_ports(
+    runner: CommandRunner,
+    resolver: Callable[[str], str | None],
+    option: str,
+) -> dict[str, tuple[str, ...]]:
+    """List ``pw-link`` ports for ``option`` (``-o`` outputs, ``-i`` inputs)."""
+
+    if resolver("pw-link") is None:
+        return {}
+    result = runner(["pw-link", "-l", option])
+    if result.returncode != 0:
+        return {}
+    return _parse_link_listing(result.stdout)
+
+
+def _channel_token(port_name: str) -> str:
+    """Return the trailing channel token (``FL``, ``FR``, ``MONO``, ...)."""
+
+    return port_name.rpartition("_")[2].strip()
+
+
+def _missing_playback_candidates(
+    output_ports: dict[str, tuple[str, ...]],
+) -> list[str]:
+    """Unlinked app playback stream outputs.
+
+    Only ports named ``output_*`` qualify; this excludes sink monitors
+    (``monitor_*``), hardware capture ports (``capture_*``), capture streams
+    (``input_*``) and MIDI ports.
+    """
+
+    return [
+        name
+        for name, links in output_ports.items()
+        if not links and "output_" in name
+    ]
+
+
+def _playback_targets(
+    playback_ports: dict[str, tuple[str, ...]],
+) -> dict[str, str]:
+    """Pick one hardware ``playback_*`` target per channel token.
+
+    Only ports named ``:playback_*`` (the physical speaker outputs) qualify.
+    Prefers the sink node that already carries the most stream links (the
+    active default sink); ties fall back to the first node reported by
+    ``pw-link``.
+    """
+
+    by_node: dict[str, dict[str, tuple[str, ...]]] = {}
+    for name, links in playback_ports.items():
+        if ":playback_" not in name:
+            continue
+        node, _separator, _ = name.partition(":")
+        by_node.setdefault(node, {})[name] = links
+    ordered = sorted(
+        by_node.values(),
+        key=lambda ports: sum(len(links) for links in ports.values()),
+        reverse=True,
+    )
+    targets: dict[str, str] = {}
+    for ports in ordered:
+        for name in ports:
+            targets.setdefault(_channel_token(name), name)
+    return targets
+
+
+def _link_outputs_to_playback(
+    runner: CommandRunner,
+    output_ports: dict[str, tuple[str, ...]],
+    playback_ports: dict[str, tuple[str, ...]],
+) -> int:
+    """Link unlinked app stream outputs to the hardware playback outputs."""
+
+    targets = _playback_targets(playback_ports)
+    created = 0
+    for name, links in output_ports.items():
+        if links or "output_" not in name:
+            continue
+        target = targets.get(_channel_token(name))
+        if target is None:
+            continue
+        if runner(["pw-link", name, target]).returncode == 0:
+            created += 1
+    return created
+
+
+def restore_default_audio_links(
+    *,
+    runner: CommandRunner = run_command,
+    resolver: Callable[[str], str | None] = shutil.which,
+    timeout_ms: int = 3000,
+    poll_interval_ms: int = 250,
+) -> int:
+    """Reconnect app streams to the hardware playback outputs after startup.
+
+    Waits (bounded by ``timeout_ms``) for the hardware ``playback_*`` input
+    ports to appear, then links every unlinked application stream output to
+    the matching channel of the most active playback node. Returns the number
+    of links created.
+    """
+
+    if resolver("pw-link") is None:
+        return 0
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while True:
+        playback_ports = _pw_link_ports(runner, resolver, "-i")
+        if playback_ports:
+            output_ports = _pw_link_ports(runner, resolver, "-o")
+            return _link_outputs_to_playback(runner, output_ports, playback_ports)
+        if time.monotonic() >= deadline:
+            return 0
+        time.sleep(poll_interval_ms / 1000.0)
+
+
 class PipeWireHealthCheck:
     """Ask the user about a missing PipeWire server and start it when asked."""
 
@@ -157,6 +311,7 @@ class PipeWireHealthCheck:
         message_box: Any = QMessageBox,
         poll_interval_ms: int = 250,
         start_timeout_ms: int = 8000,
+        link_restorer: Callable[..., int] = restore_default_audio_links,
     ) -> None:
         self._runner = runner
         self._resolver = resolver
@@ -164,6 +319,7 @@ class PipeWireHealthCheck:
         self._message_box = message_box
         self._poll_interval_ms = poll_interval_ms
         self._start_timeout_ms = start_timeout_ms
+        self._link_restorer = link_restorer
 
     def running(self) -> bool:
         return pipewire_running(runner=self._runner, resolver=self._resolver)
@@ -182,7 +338,13 @@ class PipeWireHealthCheck:
             return self._abort_start_failed(parent)
         if not self._wait_until_running():
             return self._abort_start_failed(parent)
+        self._restore_default_links()
         return True
+
+    def _restore_default_links(self) -> int:
+        """Reconnect app streams to the hardware outputs after startup."""
+
+        return self._link_restorer(runner=self._runner, resolver=self._resolver)
 
     def _ask_to_start(self, parent: QWidget | None) -> bool:
         answer = self._message_box.question(
