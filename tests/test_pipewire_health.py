@@ -416,23 +416,57 @@ class FakeLinkRunner:
 
 
 class DelayedPlaybackRunner:
-    """Reports no playback ports for the first few input listings."""
+    """Reports no hardware ports for the first few listing rounds."""
 
     def __init__(self, outputs=OUTPUT_PORTS, delay_calls=1):
         self.outputs = outputs
         self.delay_calls = delay_calls
-        self.input_calls = 0
+        self.list_calls = 0
         self.link_commands = []
 
     def __call__(self, arguments):
         arguments = tuple(arguments)
         if arguments == ("pw-link", "-l", "-i"):
-            self.input_calls += 1
-            if self.input_calls <= self.delay_calls:
+            self.list_calls += 1
+            if self.list_calls <= self.delay_calls:
                 return CommandResult(0, "", "")
             return CommandResult(0, INPUT_PORTS, "")
         if arguments == ("pw-link", "-l", "-o"):
+            if self.list_calls <= self.delay_calls:
+                return CommandResult(0, "", "")
             return CommandResult(0, self.outputs, "")
+        if arguments[0] == "pw-link":
+            self.link_commands.append(arguments)
+            return CommandResult(0, "", "")
+        return CommandResult(0, "", "")
+
+
+class MidiThenHardwareRunner:
+    """Exposes a MIDI port immediately, hardware ports only after a delay.
+
+    Mirrors the failure mode where a MIDI input port appears before the
+    physical sound devices: the routine must keep polling for ``:playback_`` /
+    ``:capture_`` ports instead of treating any input port as ready.
+    """
+
+    def __init__(self, delay_calls=1):
+        self.delay_calls = delay_calls
+        self.list_calls = 0
+        self.link_commands = []
+        self.midi_inputs = "Midi-Bridge:Midi Through:(playback_0) Midi Through Port-0\n"
+        self.midi_outputs = "Midi-Bridge:Midi Through:(capture_0) Midi Through Port-0\n"
+
+    def __call__(self, arguments):
+        arguments = tuple(arguments)
+        if arguments == ("pw-link", "-l", "-i"):
+            self.list_calls += 1
+            if self.list_calls <= self.delay_calls:
+                return CommandResult(0, self.midi_inputs, "")
+            return CommandResult(0, INPUT_PORTS, "")
+        if arguments == ("pw-link", "-l", "-o"):
+            if self.list_calls <= self.delay_calls:
+                return CommandResult(0, self.midi_outputs, "")
+            return CommandResult(0, OUTPUT_PORTS, "")
         if arguments[0] == "pw-link":
             self.link_commands.append(arguments)
             return CommandResult(0, "", "")
@@ -546,7 +580,7 @@ class RestoreDefaultAudioLinksTests(unittest.TestCase):
         self.assertEqual(created, 0)
         self.assertEqual(runner.link_commands, [])
 
-    def test_waits_for_playback_ports_to_appear(self):
+    def test_waits_for_hardware_ports_to_appear(self):
         runner = DelayedPlaybackRunner(delay_calls=1)
         created = restore_default_audio_links(
             runner=runner,
@@ -555,10 +589,22 @@ class RestoreDefaultAudioLinksTests(unittest.TestCase):
             poll_interval_ms=5,
         )
         self.assertEqual(created, 2)
-        self.assertGreaterEqual(runner.input_calls, 2)
+        self.assertGreaterEqual(runner.list_calls, 2)
         self.assertEqual(len(runner.link_commands), 2)
 
-    def test_gives_up_when_no_playback_ports_appear(self):
+    def test_waits_for_hardware_ports_even_when_midi_present(self):
+        runner = MidiThenHardwareRunner(delay_calls=1)
+        created = restore_default_audio_links(
+            runner=runner,
+            resolver=link_resolver,
+            timeout_ms=2000,
+            poll_interval_ms=5,
+        )
+        self.assertEqual(created, 2)
+        self.assertGreaterEqual(runner.list_calls, 2)
+        self.assertEqual(len(runner.link_commands), 2)
+
+    def test_gives_up_when_no_hardware_ports_appear(self):
         runner = DelayedPlaybackRunner(delay_calls=10**6)
         created = restore_default_audio_links(
             runner=runner,

@@ -271,28 +271,47 @@ def _link_outputs_to_playback(
     return created
 
 
+def _hardware_ports_visible(
+    runner: CommandRunner,
+    resolver: Callable[[str], str | None],
+) -> bool:
+    """Return whether physical hardware audio ports are visible to pw-link.
+
+    Checks the ``:playback_`` input ports (speakers) and the ``:capture_``
+    output ports (microphones); either one is enough to confirm the hardware
+    devices have registered with PipeWire.
+    """
+
+    input_ports = _pw_link_ports(runner, resolver, "-i")
+    if any(":playback_" in name for name in input_ports):
+        return True
+    output_ports = _pw_link_ports(runner, resolver, "-o")
+    return any(":capture_" in name for name in output_ports)
+
+
 def restore_default_audio_links(
     *,
     runner: CommandRunner = run_command,
     resolver: Callable[[str], str | None] = shutil.which,
-    timeout_ms: int = 3000,
-    poll_interval_ms: int = 250,
+    timeout_ms: int = 5000,
+    poll_interval_ms: int = 500,
 ) -> int:
     """Reconnect app streams to the hardware playback outputs after startup.
 
-    Waits (bounded by ``timeout_ms``) for the hardware ``playback_*`` input
-    ports to appear, then links every unlinked application stream output to
-    the matching channel of the most active playback node. Returns the number
-    of links created.
+    Polls ``pw-link`` every ``poll_interval_ms`` (bounded by ``timeout_ms``)
+    until physical hardware ports (``:playback_`` inputs or ``:capture_``
+    outputs) become visible, then links every unlinked application stream
+    output to the matching channel of the most active playback node. Returns
+    the number of links created.
     """
 
     if resolver("pw-link") is None:
         return 0
     deadline = time.monotonic() + timeout_ms / 1000.0
     while True:
-        playback_ports = _pw_link_ports(runner, resolver, "-i")
-        if playback_ports:
+        if _hardware_ports_visible(runner, resolver):
             output_ports = _pw_link_ports(runner, resolver, "-o")
+            playback_ports = _pw_link_ports(runner, resolver, "-i")
             return _link_outputs_to_playback(runner, output_ports, playback_ports)
         if time.monotonic() >= deadline:
             return 0
