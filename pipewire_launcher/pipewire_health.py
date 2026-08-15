@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -457,6 +458,141 @@ def restore_default_audio_links(
         time.sleep(poll_interval_ms / 1000.0)
 
 
+def _is_new_stream_event(line: str) -> bool:
+    """Return whether a monitor line announces a newly created audio stream.
+
+    Handles ``pactl subscribe`` lines (``Event 'new' on sink-input #N``) and
+    ``pw-mon`` node creation lines (``## new node id:N ...``); the latter may
+    also fire for hardware/capture nodes, which the idempotent restorer simply
+    leaves untouched.
+    """
+
+    stripped = line.strip()
+    if stripped.startswith("Event 'new' on sink-input"):
+        return True
+    return "## new node id:" in stripped
+
+
+def _stream_monitor_command(
+    resolver: Callable[[str], str | None],
+) -> tuple[str, ...] | None:
+    """Pick the long-lived event stream command, preferring ``pactl subscribe``."""
+
+    if resolver("pactl") is not None:
+        return ("pactl", "subscribe")
+    if resolver("pw-mon") is not None:
+        return ("pw-mon",)
+    return None
+
+
+class StreamEventWatcher:
+    """Relink freshly created application streams in the background.
+
+    A daemon thread keeps a long-lived ``pactl subscribe`` / ``pw-mon``
+    subprocess open and, whenever a new stream appears (a new Firefox tab or
+    any other JACK/PulseAudio stream), waits out the event burst and invokes
+    the link restorer so the new ports are connected to the active hardware
+    sink without requiring the user to reload or duplicate applications.
+    """
+
+    def __init__(
+        self,
+        *,
+        runner: CommandRunner = run_command,
+        resolver: Callable[[str], str | None] = shutil.which,
+        popen: Callable[..., Any] = subprocess.Popen,
+        link_restorer: Callable[..., int] = restore_default_audio_links,
+        debounce_ms: int = 400,
+    ) -> None:
+        self._runner = runner
+        self._resolver = resolver
+        self._popen = popen
+        self._link_restorer = link_restorer
+        self._debounce_s = debounce_ms / 1000.0
+        self._stop_event = threading.Event()
+        self._process: Any = None
+        self._thread: threading.Thread | None = None
+        self._restore_calls = 0
+
+    def start(self) -> bool:
+        """Launch the monitor subprocess and its background thread."""
+
+        command = _stream_monitor_command(self._resolver)
+        if command is None:
+            return False
+        try:
+            self._process = self._popen(
+                list(command),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                start_new_session=True,
+            )
+        except OSError:
+            self._process = None
+            return False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="pipewire-stream-watcher",
+            daemon=True,
+        )
+        self._thread.start()
+        return True
+
+    def _run(self) -> None:
+        """Read monitor events and restore links after each new stream."""
+
+        process = self._process
+        if process is None:
+            return
+        try:
+            while not self._stop_event.is_set():
+                line = process.stdout.readline()
+                if not line:
+                    break
+                if _is_new_stream_event(line):
+                    self._restore_after_quiet_period()
+        except Exception:
+            return
+
+    def _restore_after_quiet_period(self) -> None:
+        """Wait out the event burst, then relink any unlinked streams."""
+
+        deadline = time.monotonic() + self._debounce_s
+        while not self._stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 0.02))
+        if self._stop_event.is_set():
+            return
+        self._link_restorer(runner=self._runner, resolver=self._resolver)
+        self._restore_calls += 1
+
+    @property
+    def active(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def restore_calls(self) -> int:
+        return self._restore_calls
+
+    def stop(self) -> None:
+        """Stop the monitor and tear down its subprocess."""
+
+        self._stop_event.set()
+        process = self._process
+        if process is not None and getattr(process, "poll", None) is not None:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except OSError:
+                pass
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
+
 def qpwgraph_running(
     *,
     runner: CommandRunner = run_command,
@@ -516,6 +652,7 @@ class PipeWireHealthCheck:
         start_timeout_ms: int = 8000,
         link_restorer: Callable[..., int] = restore_default_audio_links,
         qpwgraph_restarter: Callable[..., bool] = restart_qpwgraph,
+        stream_watcher: Callable[..., Any] = StreamEventWatcher,
     ) -> None:
         self._runner = runner
         self._resolver = resolver
@@ -525,6 +662,8 @@ class PipeWireHealthCheck:
         self._start_timeout_ms = start_timeout_ms
         self._link_restorer = link_restorer
         self._qpwgraph_restarter = qpwgraph_restarter
+        self._stream_watcher_factory = stream_watcher
+        self._watcher: Any = None
 
     def running(self) -> bool:
         return pipewire_running(runner=self._runner, resolver=self._resolver)
@@ -533,6 +672,7 @@ class PipeWireHealthCheck:
         """Return True to proceed with the launcher, False to abort."""
 
         if self.running():
+            self._start_stream_watcher()
             return True
         if not self._ask_to_start(parent):
             return False
@@ -545,7 +685,29 @@ class PipeWireHealthCheck:
             return self._abort_start_failed(parent)
         self._restore_default_links()
         self._restart_qpwgraph()
+        self._start_stream_watcher()
         return True
+
+    def shutdown(self) -> None:
+        """Stop the background stream watcher, if any."""
+
+        if self._watcher is not None:
+            self._watcher.stop()
+            self._watcher = None
+
+    def _start_stream_watcher(self) -> None:
+        """Start the background stream relinker, at most once."""
+
+        if self._watcher is not None:
+            return
+        watcher = self._stream_watcher_factory(
+            runner=self._runner,
+            resolver=self._resolver,
+            popen=self._popen,
+            link_restorer=self._link_restorer,
+        )
+        if watcher.start():
+            self._watcher = watcher
 
     def _restore_default_links(self) -> int:
         """Reconnect app streams to the hardware outputs after startup."""

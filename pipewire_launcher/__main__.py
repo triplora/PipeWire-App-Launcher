@@ -581,7 +581,10 @@ def main():
     health_check = PipeWireHealthCheck()
     if not health_check.check():
         return 0
-    window = MainWindow(); window.show(); return app.exec()
+    window = MainWindow(); window.show()
+    code = app.exec()
+    health_check.shutdown()
+    return code
 
 
 if __name__ == "__main__": raise SystemExit(main())

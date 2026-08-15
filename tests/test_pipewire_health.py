@@ -1,6 +1,8 @@
 import os
 import socket
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,14 +12,17 @@ from PySide6.QtWidgets import QMessageBox
 from pipewire_launcher.pipewire_health import (
     CommandResult,
     PipeWireHealthCheck,
+    StreamEventWatcher,
     _channel_token,
     _hardware_sink_nodes,
+    _is_new_stream_event,
     _link_outputs_to_playback,
     _main_sink_node_name,
     _missing_playback_candidates,
     _parse_link_listing,
     _playback_targets,
     _sink_playback_targets,
+    _stream_monitor_command,
     _wpctl_default_sink,
     pipewire_process_running,
     pipewire_running,
@@ -897,6 +902,327 @@ class RestartQpwgraphTests(unittest.TestCase):
         )
         self.assertFalse(started)
         self.assertIn(("killall", "-9", "qpwgraph"), runner.calls)
+
+
+class IsNewStreamEventTests(unittest.TestCase):
+    def test_pactl_new_sink_input_is_detected(self):
+        self.assertTrue(_is_new_stream_event("Event 'new' on sink-input #62"))
+
+    def test_pactl_change_and_remove_are_ignored(self):
+        self.assertFalse(_is_new_stream_event("Event 'change' on sink-input #62"))
+        self.assertFalse(_is_new_stream_event("Event 'remove' on sink-input #62"))
+
+    def test_pactl_hardware_sink_event_is_ignored(self):
+        self.assertFalse(_is_new_stream_event("Event 'new' on sink #3"))
+
+    def test_pw_mon_new_node_is_detected(self):
+        self.assertTrue(
+            _is_new_stream_event(
+                "## new node id:68 type PipeWire:Interface:Node/3"
+            )
+        )
+
+    def test_pw_mon_removed_node_is_ignored(self):
+        self.assertFalse(
+            _is_new_stream_event(
+                "## removed node id:68 type PipeWire:Interface:Node/3"
+            )
+        )
+
+    def test_unrelated_lines_are_ignored(self):
+        self.assertFalse(_is_new_stream_event("Event 'new' on module"))
+        self.assertFalse(
+            _is_new_stream_event("## new link id:7 type PipeWire:Interface:Link/1")
+        )
+
+
+class StreamMonitorCommandTests(unittest.TestCase):
+    def test_prefers_pactl_over_pw_mon(self):
+        resolver = lambda name: f"/usr/bin/{name}" if name in {"pactl", "pw-mon"} else None
+        self.assertEqual(_stream_monitor_command(resolver), ("pactl", "subscribe"))
+
+    def test_falls_back_to_pw_mon(self):
+        resolver = lambda name: "/usr/bin/pw-mon" if name == "pw-mon" else None
+        self.assertEqual(_stream_monitor_command(resolver), ("pw-mon",))
+
+    def test_returns_none_without_a_monitor_tool(self):
+        self.assertIsNone(_stream_monitor_command(lambda name: None))
+
+
+class RecordingMonitorPopen:
+    def __init__(self, process):
+        self.process = process
+        self.calls = []
+
+    def __call__(self, arguments, **kwargs):
+        self.calls.append((tuple(arguments), kwargs))
+        return self.process
+
+
+class FakeMonitorProcess:
+    """Serves preloaded monitor lines, then signals EOF."""
+
+    def __init__(self, lines):
+        self.stdout = self
+        self._lines = list(lines)
+        self._index = 0
+        self.terminate_calls = 0
+
+    def readline(self):
+        if self._index < len(self._lines):
+            line = self._lines[self._index]
+            self._index += 1
+            return line
+        return ""
+
+    def poll(self):
+        return None if self._index < len(self._lines) else 0
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+
+class BlockingMonitorProcess:
+    """Blocks on readline until terminated, like a live ``pactl subscribe``."""
+
+    def __init__(self):
+        self.stdout = self
+        self._released = threading.Event()
+        self.terminate_calls = 0
+
+    def readline(self):
+        self._released.wait()
+        return ""
+
+    def poll(self):
+        return None if not self._released.is_set() else 0
+
+    def terminate(self):
+        self.terminate_calls += 1
+        self._released.set()
+
+
+def pactl_resolver(name):
+    return "/usr/bin/pactl" if name == "pactl" else None
+
+
+class StreamEventWatcherTests(unittest.TestCase):
+    def wait_until(self, predicate, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return predicate()
+
+    def watcher(
+        self,
+        process,
+        restorer=None,
+        popen=None,
+        resolver_=pactl_resolver,
+        debounce_ms=20,
+    ):
+        return StreamEventWatcher(
+            runner=FakeRunner(),
+            resolver=resolver_,
+            popen=popen or RecordingMonitorPopen(process),
+            link_restorer=restorer or RecordingRestorer(),
+            debounce_ms=debounce_ms,
+        )
+
+    def test_start_launches_pactl_and_relinks_new_streams(self):
+        process = FakeMonitorProcess([
+            "Event 'new' on sink-input #42",
+            "Event 'change' on sink-input #42",
+        ])
+        restorer = RecordingRestorer()
+        popen = RecordingMonitorPopen(process)
+        watcher = self.watcher(process, restorer, popen=popen)
+        self.assertTrue(watcher.start())
+        self.assertEqual(popen.calls[0][0], ("pactl", "subscribe"))
+        self.assertTrue(popen.calls[0][1]["start_new_session"])
+        self.assertTrue(watcher.active)
+        self.assertTrue(self.wait_until(lambda: not watcher.active))
+        self.assertEqual(watcher.restore_calls, 1)
+        self.assertEqual(len(restorer.calls), 1)
+        self.assertEqual(restorer.calls[0][1], pactl_resolver)
+        watcher.stop()
+
+    def test_pw_mon_fallback_also_relinks_new_nodes(self):
+        process = FakeMonitorProcess([
+            "## new node id:68 type PipeWire:Interface:Node/3",
+        ])
+        restorer = RecordingRestorer()
+        popen = RecordingMonitorPopen(process)
+        watcher = self.watcher(
+            process,
+            restorer,
+            popen=popen,
+            resolver_=lambda name: "/usr/bin/pw-mon" if name == "pw-mon" else None,
+        )
+        self.assertTrue(watcher.start())
+        self.assertEqual(popen.calls[0][0], ("pw-mon",))
+        self.assertTrue(self.wait_until(lambda: not watcher.active))
+        self.assertEqual(watcher.restore_calls, 1)
+        watcher.stop()
+
+    def test_ignored_events_do_not_trigger_restore(self):
+        process = FakeMonitorProcess([
+            "Event 'change' on sink-input #42",
+            "Event 'new' on sink #3",
+        ])
+        restorer = RecordingRestorer()
+        watcher = self.watcher(process, restorer)
+        self.assertTrue(watcher.start())
+        self.assertTrue(self.wait_until(lambda: not watcher.active))
+        self.assertEqual(watcher.restore_calls, 0)
+        self.assertEqual(restorer.calls, [])
+        watcher.stop()
+
+    def test_no_monitor_tool_does_not_start(self):
+        popen = RecordingMonitorPopen(FakeMonitorProcess([]))
+        watcher = self.watcher(
+            FakeMonitorProcess([]),
+            popen=popen,
+            resolver_=lambda name: None,
+        )
+        self.assertFalse(watcher.start())
+        self.assertEqual(popen.calls, [])
+        self.assertFalse(watcher.active)
+
+    def test_popen_failure_does_not_start(self):
+        def failing(_arguments, **_kwargs):
+            raise OSError("boom")
+
+        watcher = StreamEventWatcher(
+            resolver=pactl_resolver,
+            popen=failing,
+            link_restorer=RecordingRestorer(),
+        )
+        self.assertFalse(watcher.start())
+        self.assertFalse(watcher.active)
+
+    def test_stop_terminates_blocking_subprocess(self):
+        process = BlockingMonitorProcess()
+        watcher = self.watcher(process)
+        self.assertTrue(watcher.start())
+        self.assertTrue(self.wait_until(lambda: watcher.active))
+        watcher.stop()
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertFalse(watcher.active)
+
+
+class FakeStreamWatcher:
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.started = True
+        self.start_calls = 0
+        self.stop_calls = 0
+        type(self).instances.append(self)
+
+    def start(self):
+        self.start_calls += 1
+        return self.started
+
+    def stop(self):
+        self.stop_calls += 1
+
+
+class PipeWireHealthCheckWatcherTests(unittest.TestCase):
+    def setUp(self):
+        FakeStreamWatcher.instances.clear()
+
+    def check(self, runner, message_box, link_restorer=None):
+        kwargs = dict(
+            runner=runner,
+            resolver=resolver,
+            popen=FakePopen(),
+            message_box=message_box,
+            poll_interval_ms=5,
+            start_timeout_ms=50,
+            stream_watcher=lambda **kw: FakeStreamWatcher(**kw),
+        )
+        if link_restorer is not None:
+            kwargs["link_restorer"] = link_restorer
+        return PipeWireHealthCheck(**kwargs)
+
+    def test_check_starts_watcher_when_already_running(self):
+        runner = FakeRunner(initially_active=True)
+        restorer = RecordingRestorer()
+        check = self.check(runner, FakeMessageBox(), restorer)
+        self.assertTrue(check.check())
+        watcher = FakeStreamWatcher.instances[-1]
+        self.assertEqual(watcher.start_calls, 1)
+        self.assertIs(watcher.kwargs["link_restorer"], restorer)
+        self.assertEqual(restorer.calls, [])
+        check.shutdown()
+        self.assertEqual(watcher.stop_calls, 1)
+
+    def test_check_starts_watcher_after_startup(self):
+        runner = FakeRunner(
+            becomes_active_after_start=True,
+            process_after_start=True,
+        )
+        message_box = FakeMessageBox(question_answer=QMessageBox.Yes)
+        popen = FakePopen(on_start=lambda: setattr(runner, "started", True))
+        check = PipeWireHealthCheck(
+            runner=runner,
+            resolver=resolver,
+            popen=popen,
+            message_box=message_box,
+            poll_interval_ms=5,
+            start_timeout_ms=50,
+            link_restorer=RecordingRestorer(),
+            qpwgraph_restarter=RecordingRestarter(),
+            stream_watcher=lambda **kw: FakeStreamWatcher(**kw),
+        )
+        self.assertTrue(check.check())
+        watcher = FakeStreamWatcher.instances[-1]
+        self.assertEqual(watcher.start_calls, 1)
+
+    def test_declined_start_does_not_start_watcher(self):
+        runner = FakeRunner()
+        message_box = FakeMessageBox(question_answer=QMessageBox.No)
+        check = self.check(runner, message_box)
+        self.assertFalse(check.check())
+        self.assertEqual(FakeStreamWatcher.instances, [])
+
+    def test_start_failure_does_not_start_watcher(self):
+        runner = FakeRunner()
+        message_box = FakeMessageBox(question_answer=QMessageBox.Yes)
+        popen = FakePopen(on_start=lambda: setattr(runner, "started", True))
+        check = PipeWireHealthCheck(
+            runner=runner,
+            resolver=resolver,
+            popen=popen,
+            message_box=message_box,
+            poll_interval_ms=5,
+            start_timeout_ms=50,
+            stream_watcher=lambda **kw: FakeStreamWatcher(**kw),
+        )
+        self.assertFalse(check.check())
+        self.assertEqual(FakeStreamWatcher.instances, [])
+
+    def test_watcher_start_failure_is_tolerated(self):
+        runner = FakeRunner(initially_active=True)
+
+        class RefusingWatcher(FakeStreamWatcher):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.started = False
+
+        check = PipeWireHealthCheck(
+            runner=runner,
+            resolver=resolver,
+            popen=FakePopen(),
+            message_box=FakeMessageBox(),
+            stream_watcher=lambda **kw: RefusingWatcher(**kw),
+        )
+        self.assertTrue(check.check())
+        self.assertIsNone(check._watcher)
 
 
 if __name__ == "__main__":
