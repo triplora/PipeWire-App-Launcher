@@ -205,20 +205,38 @@ def _channel_token(port_name: str) -> str:
     return port_name.rpartition("_")[2].strip()
 
 
+_NON_STREAM_OUTPUT_MARKERS = (
+    ":capture_",
+    ":monitor_",
+    ":input_",
+    "Midi-Bridge",
+)
+
+
+def _is_stream_output(port_name: str) -> bool:
+    """Return whether a port name looks like an application stream output.
+
+    Excludes hardware capture ports (``:capture_*``), sink monitors
+    (``:monitor_*``), capture streams (``:input_*``) and MIDI ports, while
+    still accepting JACK-style stream names that lack the ``output_`` prefix.
+    """
+
+    return not any(marker in port_name for marker in _NON_STREAM_OUTPUT_MARKERS)
+
+
 def _missing_playback_candidates(
     output_ports: dict[str, tuple[str, ...]],
 ) -> list[str]:
     """Unlinked app playback stream outputs.
 
-    Only ports named ``output_*`` qualify; this excludes sink monitors
-    (``monitor_*``), hardware capture ports (``capture_*``), capture streams
-    (``input_*``) and MIDI ports.
+    Hardware capture, sink monitor, capture-stream and MIDI ports never
+    qualify.
     """
 
     return [
         name
         for name, links in output_ports.items()
-        if not links and "output_" in name
+        if not links and _is_stream_output(name)
     ]
 
 
@@ -251,17 +269,39 @@ def _playback_targets(
     return targets
 
 
+def _sink_playback_targets(
+    playback_ports: dict[str, tuple[str, ...]],
+    sink_node_name: str | None,
+) -> dict[str, str]:
+    """Pick the ``playback_*`` target per channel for a specific sink node.
+
+    Falls back to :func:`_playback_targets` when the sink node is unknown or
+    exposes no playback ports.
+    """
+
+    if sink_node_name is None:
+        return _playback_targets(playback_ports)
+    targets: dict[str, str] = {}
+    for name in playback_ports:
+        if name.startswith(f"{sink_node_name}:") and ":playback_" in name:
+            targets.setdefault(_channel_token(name), name)
+    if targets:
+        return targets
+    return _playback_targets(playback_ports)
+
+
 def _link_outputs_to_playback(
     runner: CommandRunner,
     output_ports: dict[str, tuple[str, ...]],
     playback_ports: dict[str, tuple[str, ...]],
+    sink_node_name: str | None = None,
 ) -> int:
     """Link unlinked app stream outputs to the hardware playback outputs."""
 
-    targets = _playback_targets(playback_ports)
+    targets = _sink_playback_targets(playback_ports, sink_node_name)
     created = 0
     for name, links in output_ports.items():
-        if links or "output_" not in name:
+        if links or not _is_stream_output(name):
             continue
         target = targets.get(_channel_token(name))
         if target is None:
@@ -289,6 +329,100 @@ def _hardware_ports_visible(
     return any(":capture_" in name for name in output_ports)
 
 
+def _pw_cli_nodes(
+    runner: CommandRunner,
+    resolver: Callable[[str], str | None],
+) -> list[dict[str, str]]:
+    """Parse ``pw-cli list-objects Node`` into per-node property dicts."""
+
+    if resolver("pw-cli") is None:
+        return []
+    result = runner(["pw-cli", "list-objects", "Node"])
+    if result.returncode != 0:
+        return []
+    nodes: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for raw_line in result.stdout.splitlines():
+        if (
+            "PipeWire:Interface:Node" in raw_line
+            and raw_line.lstrip().startswith("id ")
+        ):
+            current = {}
+            nodes.append(current)
+            continue
+        if current is None or "=" not in raw_line:
+            continue
+        key, _, value = raw_line.strip().partition("=")
+        current[key.strip()] = value.strip().strip('"')
+    return nodes
+
+
+def _hardware_sink_nodes(
+    runner: CommandRunner,
+    resolver: Callable[[str], str | None],
+) -> list[dict[str, str]]:
+    """Return the ALSA hardware sink nodes present in the graph."""
+
+    return [
+        props
+        for props in _pw_cli_nodes(runner, resolver)
+        if props.get("media.class") == "Audio/Sink"
+        and props.get("node.name", "").startswith("alsa_output.")
+    ]
+
+
+def _wpctl_default_sink(
+    runner: CommandRunner,
+    resolver: Callable[[str], str | None],
+) -> str | None:
+    """Return the node description of the default sink from ``wpctl status``.
+
+    WirePlumber marks the default sink with ``*`` in the Sinks section; the
+    description is matched back to a node name via ``pw-cli``.
+    """
+
+    if resolver("wpctl") is None:
+        return None
+    result = runner(["wpctl", "status"])
+    if result.returncode != 0:
+        return None
+    in_sinks = False
+    for raw_line in result.stdout.splitlines():
+        stripped = raw_line.strip()
+        if "Sinks:" in stripped:
+            in_sinks = True
+            continue
+        if not in_sinks:
+            continue
+        if stripped.startswith(("├─", "└─")):
+            return None
+        if "*" not in stripped:
+            continue
+        rest = stripped.lstrip("│├└─* \t")
+        _number, separator, description = rest.partition(". ")
+        if not separator:
+            continue
+        return description.partition(" [")[0].strip() or None
+    return None
+
+
+def _main_sink_node_name(
+    runner: CommandRunner,
+    resolver: Callable[[str], str | None],
+) -> str | None:
+    """Exact node name of the default hardware sink, or None when unknown."""
+
+    sinks = _hardware_sink_nodes(runner, resolver)
+    if not sinks:
+        return None
+    default_description = _wpctl_default_sink(runner, resolver)
+    if default_description:
+        for props in sinks:
+            if props.get("node.description") == default_description:
+                return props["node.name"]
+    return None
+
+
 def restore_default_audio_links(
     *,
     runner: CommandRunner = run_command,
@@ -300,9 +434,11 @@ def restore_default_audio_links(
 
     Polls ``pw-link`` every ``poll_interval_ms`` (bounded by ``timeout_ms``)
     until physical hardware ports (``:playback_`` inputs or ``:capture_``
-    outputs) become visible, then links every unlinked application stream
-    output to the matching channel of the most active playback node. Returns
-    the number of links created.
+    outputs) become visible. The main hardware sink is then identified via
+    ``pw-cli`` + ``wpctl`` so the FL/FR channels are forced onto the active
+    default device (WirePlumber leaves idle, stopped streams unlinked), and
+    every unlinked application stream output is linked to its matching channel.
+    Returns the number of links created.
     """
 
     if resolver("pw-link") is None:
@@ -312,7 +448,10 @@ def restore_default_audio_links(
         if _hardware_ports_visible(runner, resolver):
             output_ports = _pw_link_ports(runner, resolver, "-o")
             playback_ports = _pw_link_ports(runner, resolver, "-i")
-            return _link_outputs_to_playback(runner, output_ports, playback_ports)
+            sink_node_name = _main_sink_node_name(runner, resolver)
+            return _link_outputs_to_playback(
+                runner, output_ports, playback_ports, sink_node_name
+            )
         if time.monotonic() >= deadline:
             return 0
         time.sleep(poll_interval_ms / 1000.0)

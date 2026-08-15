@@ -11,10 +11,14 @@ from pipewire_launcher.pipewire_health import (
     CommandResult,
     PipeWireHealthCheck,
     _channel_token,
+    _hardware_sink_nodes,
     _link_outputs_to_playback,
+    _main_sink_node_name,
     _missing_playback_candidates,
     _parse_link_listing,
     _playback_targets,
+    _sink_playback_targets,
+    _wpctl_default_sink,
     pipewire_process_running,
     pipewire_running,
     qpwgraph_running,
@@ -349,6 +353,38 @@ alsa_playback.speaker-test:output_FR
 
 PCI_PLAYBACK_FL = "alsa_output.pci-0000_0e_00.4.analog-stereo:playback_FL"
 PCI_PLAYBACK_FR = "alsa_output.pci-0000_0e_00.4.analog-stereo:playback_FR"
+PCI_SINK_NODE = "alsa_output.pci-0000_0e_00.4.analog-stereo"
+USB_SINK_NODE = "alsa_output.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-stereo"
+
+PW_CLI_NODES = """id 37, type PipeWire:Interface:Node/3
+\tobject.serial = "58"
+\tmedia.class = "Audio/Sink"
+\tnode.name = "alsa_output.pci-0000_0e_00.4.analog-stereo"
+\tnode.description = "Starship/Matisse HD Audio Controller Analog Stereo"
+id 52, type PipeWire:Interface:Node/3
+\tobject.serial = "56"
+\tmedia.class = "Audio/Sink"
+\tnode.name = "alsa_output.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-stereo"
+\tnode.description = "USB PnP Sound Device Analog Stereo"
+id 64, type PipeWire:Interface:Node/3
+\tobject.serial = "83"
+\tmedia.class = "Stream/Output/Audio"
+\tnode.name = "Firefox"
+"""
+
+WPCTL_STATUS = """PipeWire 'pipewire-0'
+ └─ Clients:
+        32. xdg-desktop-portal
+Audio
+ ├─ Sinks:
+ │  *   37. Starship/Matisse HD Audio Controller Analog Stereo [vol: 0.18]
+ │      52. USB PnP Sound Device Analog Stereo  [vol: 0.65]
+ │
+ ├─ Sink endpoints:
+ ├─ Sources:
+ │      51. Starship/Matisse HD Audio Controller Analog Stereo [vol: 1.00]
+ │  *   53. USB PnP Sound Device Mono           [vol: 0.24]
+"""
 
 
 class RecordingRestorer:
@@ -477,6 +513,43 @@ def link_resolver(name):
     return "/usr/bin/pw-link" if name == "pw-link" else None
 
 
+def node_resolver(name):
+    path = link_resolver(name)
+    if path is not None:
+        return path
+    if name in {"pw-cli", "wpctl"}:
+        return f"/usr/bin/{name}"
+    return None
+
+
+class HardwareSinkRunner(FakeLinkRunner):
+    """Serves ``pw-cli``/``wpctl`` alongside the standard pw-link listings."""
+
+    def __init__(
+        self,
+        inputs=INPUT_PORTS,
+        outputs=OUTPUT_PORTS,
+        link_rc=0,
+        pw_cli_nodes=PW_CLI_NODES,
+        wpctl_status=WPCTL_STATUS,
+    ):
+        super().__init__(inputs=inputs, outputs=outputs, link_rc=link_rc)
+        self.pw_cli_nodes = pw_cli_nodes
+        self.wpctl_status = wpctl_status
+        self.node_calls = 0
+        self.wpctl_calls = 0
+
+    def __call__(self, arguments):
+        arguments = tuple(arguments)
+        if arguments == ("pw-cli", "list-objects", "Node"):
+            self.node_calls += 1
+            return CommandResult(0, self.pw_cli_nodes, "")
+        if arguments == ("wpctl", "status"):
+            self.wpctl_calls += 1
+            return CommandResult(0, self.wpctl_status, "")
+        return super().__call__(arguments)
+
+
 class LinkListingParsingTests(unittest.TestCase):
     def test_ports_and_their_links_are_parsed(self):
         ports = _parse_link_listing(OUTPUT_PORTS)
@@ -554,6 +627,67 @@ class LinkTargetSelectionTests(unittest.TestCase):
         })
 
 
+class DefaultSinkIdentificationTests(unittest.TestCase):
+    def test_hardware_sink_nodes_extracted_from_pw_cli(self):
+        runner = HardwareSinkRunner()
+        nodes = _hardware_sink_nodes(runner, node_resolver)
+        self.assertEqual(
+            [props["node.name"] for props in nodes],
+            [PCI_SINK_NODE, USB_SINK_NODE],
+        )
+        self.assertEqual(
+            [props["node.description"] for props in nodes],
+            [
+                "Starship/Matisse HD Audio Controller Analog Stereo",
+                "USB PnP Sound Device Analog Stereo",
+            ],
+        )
+
+    def test_no_sink_nodes_without_pw_cli(self):
+        runner = HardwareSinkRunner()
+        nodes = _hardware_sink_nodes(runner, link_resolver)
+        self.assertEqual(nodes, [])
+
+    def test_wpctl_default_sink_description_is_extracted(self):
+        runner = HardwareSinkRunner()
+        description = _wpctl_default_sink(runner, node_resolver)
+        self.assertEqual(
+            description,
+            "Starship/Matisse HD Audio Controller Analog Stereo",
+        )
+
+    def test_wpctl_default_sink_returns_none_without_wpctl(self):
+        runner = HardwareSinkRunner()
+        self.assertIsNone(_wpctl_default_sink(runner, link_resolver))
+
+    def test_main_sink_node_name_maps_wpctl_description_to_node(self):
+        runner = HardwareSinkRunner()
+        self.assertEqual(_main_sink_node_name(runner, node_resolver), PCI_SINK_NODE)
+
+    def test_main_sink_node_name_is_none_without_sink_nodes(self):
+        runner = HardwareSinkRunner(pw_cli_nodes="")
+        self.assertIsNone(_main_sink_node_name(runner, node_resolver))
+
+    def test_sink_playback_targets_favor_the_named_sink(self):
+        targets = _sink_playback_targets(
+            _parse_link_listing(INPUT_PORTS),
+            PCI_SINK_NODE,
+        )
+        self.assertEqual(targets, {"FL": PCI_PLAYBACK_FL, "FR": PCI_PLAYBACK_FR})
+
+    def test_sink_playback_targets_fall_back_to_heuristic(self):
+        ports = _parse_link_listing(INPUT_PORTS)
+        self.assertEqual(
+            _sink_playback_targets(ports, None),
+            _playback_targets(ports),
+        )
+
+    def test_sink_playback_targets_fall_back_when_sink_has_no_ports(self):
+        ports = _parse_link_listing(INPUT_PORTS)
+        targets = _sink_playback_targets(ports, "alsa_output.nonexistent")
+        self.assertEqual(targets, {"FL": PCI_PLAYBACK_FL, "FR": PCI_PLAYBACK_FR})
+
+
 class RestoreDefaultAudioLinksTests(unittest.TestCase):
     def test_unlinked_streams_are_linked_to_the_active_sink(self):
         runner = FakeLinkRunner()
@@ -568,6 +702,47 @@ class RestoreDefaultAudioLinksTests(unittest.TestCase):
             ("pw-link", "alsa_playback.firefox:output_FL", PCI_PLAYBACK_FL),
             ("pw-link", "alsa_playback.firefox:output_FR", PCI_PLAYBACK_FR),
         ])
+
+    def test_streams_link_to_the_wpctl_default_sink_when_none_linked(self):
+        inputs = INPUT_PORTS.replace(
+            "  |<- alsa_playback.speaker-test:output_FL\n", ""
+        ).replace(
+            "  |<- alsa_playback.speaker-test:output_FR\n", ""
+        )
+        runner = HardwareSinkRunner(inputs=inputs)
+        created = restore_default_audio_links(
+            runner=runner,
+            resolver=node_resolver,
+            timeout_ms=100,
+            poll_interval_ms=5,
+        )
+        self.assertEqual(created, 2)
+        self.assertEqual(runner.link_commands, [
+            ("pw-link", "alsa_playback.firefox:output_FL", PCI_PLAYBACK_FL),
+            ("pw-link", "alsa_playback.firefox:output_FR", PCI_PLAYBACK_FR),
+        ])
+        self.assertGreaterEqual(runner.node_calls, 1)
+        self.assertGreaterEqual(runner.wpctl_calls, 1)
+
+    def test_jack_style_stream_outputs_are_also_linked(self):
+        runner = HardwareSinkRunner(
+            outputs=OUTPUT_PORTS + "jackapp:out_FL\njackapp:out_FR\n"
+        )
+        created = restore_default_audio_links(
+            runner=runner,
+            resolver=node_resolver,
+            timeout_ms=100,
+            poll_interval_ms=5,
+        )
+        self.assertEqual(created, 4)
+        self.assertIn(
+            ("pw-link", "jackapp:out_FL", PCI_PLAYBACK_FL),
+            runner.link_commands,
+        )
+        self.assertIn(
+            ("pw-link", "jackapp:out_FR", PCI_PLAYBACK_FR),
+            runner.link_commands,
+        )
 
     def test_no_links_are_created_without_pw_link(self):
         runner = FakeLinkRunner()
