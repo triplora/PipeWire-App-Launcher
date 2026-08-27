@@ -99,6 +99,43 @@ Screenshots of the main areas of the launcher (drag your captures into
 
 ![Diagnóstico do Servidor](docs/images/health_check.png)
 
+## Install or update the AppImage
+
+The repository includes a per-user installer/updater for the latest official
+x86_64 AppImage. It does not use `sudo`: the AppImage, command link, desktop
+entry, and icon are installed below the user's XDG directories.
+
+Clone the repository and run:
+
+```bash
+git clone https://github.com/triplora/PipeWire-App-Launcher.git
+cd PipeWire-App-Launcher
+bash scripts/install-or-update.sh --check
+check_exit=$?
+if [ "$check_exit" -eq 10 ]; then
+  bash scripts/install-or-update.sh
+fi
+```
+
+`--check` changes nothing and exits with 0 when the installed AppImage is
+current or 10 when installation/an update is required. Run without options to
+install or update, or use `--force` to reinstall the latest release.
+
+The installer resolves GitHub's latest official release, validates the release
+checksum file, verifies the downloaded AppImage's SHA-256 digest and reported
+version, then replaces the application atomically. During an update, the prior
+AppImage is retained as `PipeWire-App-Launcher-x86_64.AppImage.previous`.
+
+Default paths:
+
+- command: `~/.local/bin/pipewire-app-launcher`
+- AppImage: `~/.local/share/pipewire-app-launcher/PipeWire-App-Launcher-x86_64.AppImage`
+- desktop entry: `~/.local/share/applications/pipewire-app-launcher.desktop`
+
+If `~/.local/bin` is not already in `PATH`, launch with
+`~/.local/bin/pipewire-app-launcher` or add that directory to your shell
+configuration.
+
 ## How to Run
 
 ### With Conda (recommended)
