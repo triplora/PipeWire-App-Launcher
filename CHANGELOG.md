@@ -8,6 +8,10 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Add a checksum-verified per-user script that installs or updates the latest
+  official AppImage, desktop entry, command link, and icon.
+- Add an offline installer regression matrix for check, install, update, and
+  forced-reinstall paths.
 - List installed audio applications from XDG desktop entries by audio-related
   `Categories` (Audio, AudioVideo, Music, MIDI) or known audio executables.
 - Add an "Audio Apps" tab with per-application enable toggles persisted to
