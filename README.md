@@ -14,6 +14,11 @@ applications through PipeWire's `pw-jack` compatibility layer. It is designed
 and validated for **Ubuntu 24.04** and distributed as a portable AppImage, so it
 runs without a system-wide installation.
 
+![PipeWire App Launcher profile manager showing an Ardour profile and its pw-jack command preview](docs/images/profile-manager.png)
+
+*Profile manager with executable, arguments, environment, process supervision,
+and PipeWire discovery in one window.*
+
 Beyond the classic profile manager, the launcher behaves like a small audio
 routing assistant:
 
@@ -67,6 +72,11 @@ manager:
 - The list is populated automatically at startup and can be refreshed with
   "Scan for audio apps".
 
+![PipeWire App Launcher Audio Apps panel listing detected audio applications and their status](docs/images/audio-apps.png)
+
+*Audio Apps panel with detected applications, launch commands, enable controls,
+and live process status.*
+
 ### Dynamic Background Monitoring
 
 The launcher now routes new audio streams as they appear, with no user action:
@@ -83,21 +93,6 @@ The launcher now routes new audio streams as they appear, with no user action:
   capture, MIDI, and monitor ports are ignored.
 - This fixes the orphaned-stream problem where tabs that were open before a
   server restart would stay silent until manually reloaded or duplicated.
-
-## Visual Examples
-
-Screenshots of the main areas of the launcher (drag your captures into
-`docs/images/`):
-
-![Interface do Painel](docs/images/audio_panel.png)
-
-![Grafo de Conexões](docs/images/pipewire_graph.png)
-
-![Editor de Perfil](docs/images/profile_editor.png)
-
-![Descoberta de Nós PipeWire](docs/images/pipewire_discovery.png)
-
-![Diagnóstico do Servidor](docs/images/health_check.png)
 
 ## Install or update the AppImage
 
