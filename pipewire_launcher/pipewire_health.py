@@ -36,6 +36,7 @@ _START_FAILED_WARNING = (
 )
 
 _PIPEWIRE_SERVICES = ("pipewire", "pipewire-pulse", "wireplumber")
+_PIPEWIRE_SOCKETS = ("pipewire.socket", "pipewire-pulse.socket")
 
 
 @dataclass(frozen=True)
@@ -142,7 +143,7 @@ def start_pipewire_services(
         return False
     try:
         popen(
-            ["systemctl", "--user", "start", *services],
+            ["systemctl", "--user", "start", *_PIPEWIRE_SOCKETS, *services],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -150,6 +151,45 @@ def start_pipewire_services(
     except OSError:
         return False
     return True
+
+
+def _control_pipewire_services(
+    action: str,
+    services: Sequence[str] = _PIPEWIRE_SERVICES,
+    *,
+    runner: CommandRunner = run_command,
+    resolver: Callable[[str], str | None] = shutil.which,
+) -> bool:
+    """Synchronously control user services from a non-GUI worker thread."""
+
+    if action not in {"start", "stop", "restart"}:
+        raise ValueError("unsupported PipeWire service action")
+    if resolver("systemctl") is None:
+        return False
+    return runner([
+        "systemctl", "--user", action, *services
+    ]).returncode == 0
+
+
+def start_pipewire_services_sync(**kwargs) -> bool:
+    services = kwargs.pop("services", _PIPEWIRE_SERVICES)
+    return _control_pipewire_services(
+        "start", (*_PIPEWIRE_SOCKETS, *services), **kwargs
+    )
+
+
+def stop_pipewire_services(**kwargs) -> bool:
+    services = kwargs.pop("services", _PIPEWIRE_SERVICES)
+    # Ubuntu activates PipeWire through user sockets. Stopping only the
+    # services leaves those sockets listening and systemd immediately starts
+    # the services again. Stop activation sources and services atomically.
+    return _control_pipewire_services(
+        "stop", (*_PIPEWIRE_SOCKETS, *services), **kwargs
+    )
+
+
+def restart_pipewire_services(**kwargs) -> bool:
+    return _control_pipewire_services("restart", **kwargs)
 
 
 def _link_target(raw_line: str) -> str:
@@ -605,25 +645,13 @@ def qpwgraph_running(
     return runner(["pgrep", "-x", "qpwgraph"]).returncode == 0
 
 
-def restart_qpwgraph(
+def start_qpwgraph(
     *,
-    runner: CommandRunner = run_command,
     resolver: Callable[[str], str | None] = shutil.which,
     popen: Callable[..., Any] = subprocess.Popen,
 ) -> bool:
-    """Restart qpwgraph so it registers a fresh system tray icon.
+    """Launch qpwgraph in a new process session without a shell."""
 
-    When the PipeWire sockets go down and come back up, a leftover qpwgraph
-    keeps a stale connection and never re-registers its Ubuntu tray icon.
-    Force-close any running instance and launch a clean one in the background.
-    Returns whether the fresh instance was launched.
-    """
-
-    if (
-        qpwgraph_running(runner=runner, resolver=resolver)
-        and resolver("killall") is not None
-    ):
-        runner(["killall", "-9", "qpwgraph"])
     if resolver("qpwgraph") is None:
         return False
     try:
@@ -636,6 +664,42 @@ def restart_qpwgraph(
     except OSError:
         return False
     return True
+
+
+def stop_qpwgraph(
+    *,
+    runner: CommandRunner = run_command,
+    resolver: Callable[[str], str | None] = shutil.which,
+    timeout_ms: int = 2000,
+    poll_interval_ms: int = 100,
+) -> bool:
+    """Request graceful termination, then use SIGKILL after a deadline."""
+
+    if not qpwgraph_running(runner=runner, resolver=resolver):
+        return True
+    if resolver("pkill") is None:
+        return False
+    runner(["pkill", "-TERM", "-x", "qpwgraph"])
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        if not qpwgraph_running(runner=runner, resolver=resolver):
+            return True
+        time.sleep(poll_interval_ms / 1000.0)
+    runner(["pkill", "-KILL", "-x", "qpwgraph"])
+    return not qpwgraph_running(runner=runner, resolver=resolver)
+
+
+def restart_qpwgraph(
+    *,
+    runner: CommandRunner = run_command,
+    resolver: Callable[[str], str | None] = shutil.which,
+    popen: Callable[..., Any] = subprocess.Popen,
+) -> bool:
+    """Gracefully replace qpwgraph so it reconnects to fresh sockets."""
+
+    if not stop_qpwgraph(runner=runner, resolver=resolver):
+        return False
+    return start_qpwgraph(resolver=resolver, popen=popen)
 
 
 class PipeWireHealthCheck:
@@ -695,11 +759,19 @@ class PipeWireHealthCheck:
             self._watcher.stop()
             self._watcher = None
 
+    def start_watcher(self) -> None:
+        """Resume background stream monitoring after a controlled startup."""
+
+        self._start_stream_watcher()
+
     def _start_stream_watcher(self) -> None:
         """Start the background stream relinker, at most once."""
 
         if self._watcher is not None:
-            return
+            if getattr(self._watcher, "active", True):
+                return
+            self._watcher.stop()
+            self._watcher = None
         watcher = self._stream_watcher_factory(
             runner=self._runner,
             resolver=self._resolver,

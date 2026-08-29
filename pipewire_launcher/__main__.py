@@ -13,7 +13,7 @@ if "--version" in sys.argv[1:]:
 import time
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Qt
-from PySide6.QtGui import QAction, QFontDatabase
+from PySide6.QtGui import QAction, QColor, QFontDatabase, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -29,6 +29,10 @@ from pipewire_launcher.application_detection import (
 )
 from pipewire_launcher.audio_applications import AudioApplicationManager
 from pipewire_launcher.audio_panel import AudioApplicationsPanel
+from pipewire_launcher.audio_stack_controller import (
+    AudioStackController,
+    AudioStackState,
+)
 from pipewire_launcher.core import Profile, ProfileStore, command_parts, command_preview, parse_arguments, parse_environment, validate_profile
 from pipewire_launcher.process_supervision import ProcessExecution, ProcessRegistry, ProcessState, ProcessTerminator
 from pipewire_launcher.pipewire_health import PipeWireHealthCheck
@@ -81,7 +85,7 @@ def select_application_candidates(
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, audio_stack_controller: AudioStackController | None = None):
         super().__init__()
         self.setWindowTitle("PipeWire App Launcher")
         self.resize(1080, 680)
@@ -98,6 +102,7 @@ class MainWindow(QMainWindow):
         self._closing_started = False
         self._discovery_request_id: str | None = None
         self.discovery_runner = PipeWireDiscoveryRunner(self)
+        self.audio_stack_controller = audio_stack_controller
         self.audio_manager = AudioApplicationManager()
         self._build_ui()
         self._connect_discovery_signals()
@@ -113,6 +118,22 @@ class MainWindow(QMainWindow):
             action = QAction(text, self); action.triggered.connect(slot); toolbar.addAction(action)
         toolbar.addSeparator()
         action = QAction("Detect Apps", self); action.triggered.connect(self.detect_applications); toolbar.addAction(action)
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel("Audio stack:"))
+        self.audio_stack_button = QPushButton("Checking…")
+        self.audio_stack_button.setEnabled(False)
+        self.audio_stack_button.setToolTip(
+            "PipeWire: checking\nqpwgraph: checking"
+        )
+        self.audio_stack_button.clicked.connect(self._audio_stack_clicked)
+        toolbar.addWidget(self.audio_stack_button)
+        if self.audio_stack_controller is not None:
+            self.audio_stack_controller.state_changed.connect(
+                self._audio_stack_state_changed
+            )
+            self.audio_stack_controller.operation_failed.connect(
+                self._audio_stack_failed
+            )
 
         self.search = QLineEdit(); self.search.setPlaceholderText("Search profiles…"); self.search.textChanged.connect(self.refresh_list)
         self.list = QListWidget(); self.list.currentItemChanged.connect(self.select_item)
@@ -155,6 +176,70 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(tabs)
         self.setStatusBar(QStatusBar()); self.statusBar().showMessage("Ready")
         self._update_discovery_controls()
+
+    @staticmethod
+    def _status_icon(color: str) -> QIcon:
+        pixmap = QPixmap(14, 14)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(2, 2, 10, 10)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _audio_stack_state_changed(self, state: AudioStackState) -> None:
+        if self._closing_started:
+            return
+        presentations = {
+            AudioStackState.RUNNING: ("Stop", "#2ecc71", True),
+            AudioStackState.PIPEWIRE_ONLY: ("Restart", "#f39c12", True),
+            AudioStackState.STOPPED: ("Start", "#e74c3c", True),
+            AudioStackState.ORPHANED_QPWGRAPH: ("Start", "#e74c3c", True),
+            AudioStackState.CHECKING: ("Checking…", "#7f8c8d", False),
+            AudioStackState.STARTING: ("Starting…", "#7f8c8d", False),
+            AudioStackState.STOPPING: ("Stopping…", "#7f8c8d", False),
+            AudioStackState.RESTARTING: ("Restarting…", "#7f8c8d", False),
+            AudioStackState.FAILED: ("Start", "#e74c3c", True),
+        }
+        text, color, enabled = presentations[state]
+        self.audio_stack_button.setText(text)
+        self.audio_stack_button.setIcon(self._status_icon(color))
+        self.audio_stack_button.setEnabled(enabled)
+        snapshot = (
+            self.audio_stack_controller.snapshot
+            if self.audio_stack_controller is not None else None
+        )
+        pipewire = "running" if snapshot and snapshot.pipewire else "stopped"
+        qpwgraph = "running" if snapshot and snapshot.qpwgraph else "stopped"
+        self.audio_stack_button.setToolTip(
+            f"PipeWire: {pipewire}\nqpwgraph: {qpwgraph}\nAction: {text}"
+        )
+
+    def _audio_stack_clicked(self) -> None:
+        controller = self.audio_stack_controller
+        if controller is None or controller.busy:
+            return
+        if controller.state == AudioStackState.RUNNING:
+            answer = QMessageBox.question(
+                self,
+                "Stop audio stack",
+                "Stopping PipeWire interrupts audio for the entire desktop. "
+                "Stop PipeWire and qpwgraph?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        controller.trigger()
+
+    def _audio_stack_failed(self, message: str) -> None:
+        if self._closing_started:
+            return
+        self.statusBar().showMessage(
+            f"Audio stack operation failed: {message}", 8000
+        )
 
     def _connect_discovery_signals(self):
         self.discovery_runner.state_changed.connect(self._discovery_state_changed)
@@ -520,6 +605,8 @@ class MainWindow(QMainWindow):
                 self._closing_started = True
                 self.discovery_runner.shutdown()
                 self.audio_panel.shutdown()
+                if self.audio_stack_controller is not None:
+                    self.audio_stack_controller.shutdown()
             event.accept(); return
         if not self.close_requested:
             answer = QMessageBox.question(self, "Processes running", "Stop all running processes before closing?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
@@ -529,6 +616,8 @@ class MainWindow(QMainWindow):
             self._closing_started = True
             self.discovery_runner.shutdown()
             self.audio_panel.shutdown()
+            if self.audio_stack_controller is not None:
+                self.audio_stack_controller.shutdown()
             for record in active:
                 if self.registry.request_stop(record.profile_id, record.generation, record.process):
                     self.terminator.graceful(record.process)
@@ -579,9 +668,13 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv); app.setApplicationName("PipeWire App Launcher"); app.setOrganizationName("R. Brothers Studio")
     health_check = PipeWireHealthCheck()
-    if not health_check.check():
-        return 0
-    window = MainWindow(); window.show()
+    if health_check.running():
+        health_check.start_watcher()
+    controller = AudioStackController(
+        watcher_start=health_check.start_watcher,
+        watcher_stop=health_check.shutdown,
+    )
+    window = MainWindow(controller); window.show(); controller.start_monitoring()
     code = app.exec()
     health_check.shutdown()
     return code

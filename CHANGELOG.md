@@ -8,6 +8,14 @@ and the project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Add an asynchronous PipeWire/qpwgraph lifecycle controller with serialized,
+  timeout-bounded Start, Stop, and Restart operations.
+- Add a toolbar control whose green `Stop`, orange `Restart`, and red `Start`
+  states reflect the observed health of both applications.
+- Detect external audio-stack changes periodically without blocking the Qt
+  event loop, restore audio links after startup, and resume stream monitoring.
+- Stop qpwgraph gracefully before a bounded forced-termination fallback and
+  require confirmation before stopping desktop-wide PipeWire audio.
 - Add a checksum-verified per-user script that installs or updates the latest
   official AppImage, desktop entry, command link, and icon.
 - Add an offline installer regression matrix for check, install, update, and
@@ -19,6 +27,13 @@ and the project follows [Semantic Versioning](https://semver.org/).
 - Check PipeWire health before opening the launcher and offer to start the
   `pipewire`, `pipewire-pulse`, and `wireplumber` user units when it is not
   running.
+
+### Fixed
+
+- Stop the PipeWire user sockets together with the services so systemd socket
+  activation cannot immediately restart the audio stack.
+- Reactivate both PipeWire user sockets during Start so the normal systemd
+  socket-activation contract is restored after a launcher-managed Stop.
 
 ### Planned
 

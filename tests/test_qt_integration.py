@@ -1,6 +1,7 @@
 import enum
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -34,6 +35,30 @@ class Signal:
     def emit(self, *args):
         for slot in tuple(self._slots):
             slot(*args)
+
+
+class FakeAudioStackController:
+    def __init__(self, state):
+        self.state_changed = Signal()
+        self.operation_failed = Signal()
+        self.state = state
+        self.snapshot = SimpleNamespace(
+            pipewire=state in {
+                launcher.AudioStackState.PIPEWIRE_ONLY,
+                launcher.AudioStackState.RUNNING,
+            },
+            qpwgraph=state == launcher.AudioStackState.RUNNING,
+        )
+        self.busy = False
+        self.trigger_calls = 0
+        self.shutdown_calls = 0
+
+    def trigger(self):
+        self.trigger_calls += 1
+        return True
+
+    def shutdown(self):
+        self.shutdown_calls += 1
 
 
 class FakeProcess:
@@ -282,6 +307,35 @@ class MainWindowQtTests(unittest.TestCase):
         self.assertEqual(self.window.current_id, "profile-one")
         self.assertEqual(self.window.selected_profile().name, "One")
         self.assertIn("State: stopped", self.window.process_info.text())
+
+    def test_audio_stack_button_maps_states_to_text_and_light(self):
+        expected = {
+            launcher.AudioStackState.RUNNING: ("Stop", True),
+            launcher.AudioStackState.PIPEWIRE_ONLY: ("Restart", True),
+            launcher.AudioStackState.STOPPED: ("Start", True),
+            launcher.AudioStackState.ORPHANED_QPWGRAPH: ("Start", True),
+            launcher.AudioStackState.STARTING: ("Starting…", False),
+        }
+        for state, (text, enabled) in expected.items():
+            with self.subTest(state=state):
+                self.window._audio_stack_state_changed(state)
+                self.assertEqual(self.window.audio_stack_button.text(), text)
+                self.assertEqual(self.window.audio_stack_button.isEnabled(), enabled)
+                self.assertFalse(self.window.audio_stack_button.icon().isNull())
+
+    def test_running_stack_requires_confirmation_before_stop(self):
+        controller = FakeAudioStackController(launcher.AudioStackState.RUNNING)
+        window = launcher.MainWindow(controller)
+        window._audio_stack_state_changed(controller.state)
+        FakeMessageBox.answer = QMessageBox.No
+        window.audio_stack_button.click()
+        self.assertEqual(controller.trigger_calls, 0)
+        FakeMessageBox.answer = QMessageBox.Yes
+        window.audio_stack_button.click()
+        self.assertEqual(controller.trigger_calls, 1)
+        window.close()
+        window.deleteLater()
+        FakeMessageBox.answer = QMessageBox.No
 
     def test_detection_dialog_selects_nothing_by_default(self):
         candidate = ApplicationCandidate(

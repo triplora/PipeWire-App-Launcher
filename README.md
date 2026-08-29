@@ -3,7 +3,7 @@
 [![Tests](https://github.com/triplora/PipeWire-App-Launcher/actions/workflows/tests.yml/badge.svg)](https://github.com/triplora/PipeWire-App-Launcher/actions/workflows/tests.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-> **Project status:** alpha. Version 0.1.4 was functionally validated on Ubuntu
+> **Project status:** alpha. Version 0.1.5 is under validation on Ubuntu
 > 24.04 with PipeWire discovery and JACK applications launched through
 > `pw-jack`.
 
@@ -22,9 +22,8 @@ and PipeWire discovery in one window.*
 Beyond the classic profile manager, the launcher behaves like a small audio
 routing assistant:
 
-- It checks that the PipeWire server (and its `pipewire-pulse` /
-  `wireplumber` companions) is alive **before** opening the window, and offers
-  to start it through graphical dialogs when it is not.
+- It checks PipeWire, `pipewire-pulse`, `wireplumber`, and qpwgraph without
+  blocking startup, then exposes their combined state in the main toolbar.
 - It lists every installed audio application in a dedicated "Audio Apps" panel,
   so multiple sound processes can be started and stopped with one click.
 - It monitors PipeWire in the **background** and automatically reconnects
@@ -33,21 +32,38 @@ routing assistant:
 
 ## New Features
 
+### PipeWire and qpwgraph lifecycle control
+
+The **Audio stack** button in the main toolbar tracks PipeWire and qpwgraph and
+changes its action automatically:
+
+- a green **Stop** state means both applications are running;
+- an orange **Restart** state means PipeWire is running without qpwgraph;
+- a red **Start** state means PipeWire is stopped, including the unhealthy case
+  where an orphaned qpwgraph process is still present;
+- transitional `Starting…`, `Stopping…`, and `Restarting…` states disable the
+  button so duplicate operations cannot overlap.
+
+Start and Restart wait for the real services, launch a fresh qpwgraph, restore
+default audio links, and resume background stream monitoring. Stop asks for
+confirmation because it interrupts audio for the entire desktop. Operations
+run outside the GUI thread, use argument-only commands without a shell or
+`sudo`, and return to the observed state after a failure or timeout.
+
 ### Server Diagnostics and Health
 
-On every startup the launcher verifies the PipeWire server before opening the
+On every startup the launcher verifies the PipeWire server while opening the
 main window:
 
 - Checks the per-user systemd unit (`systemctl --user is-active pipewire`),
   falling back to process and socket probes when no user bus is available.
-- If the server is down, a graphical dialog offers to start it:
-
-  > O servidor de áudio PipeWire não está rodando. Deseja iniciá-lo agora?
-
-- Answering "Sim" starts `pipewire`, `pipewire-pulse`, and `wireplumber`
-  through `systemctl --user start` and waits until the server is ready.
-- Answering "Não" (or a failed start) closes the launcher with a warning
-  instead of opening a broken session.
+- If the server is down, the window remains available with the red **Start**
+  control instead of aborting startup.
+- **Start** runs `pipewire`, `pipewire-pulse`, and `wireplumber` through
+  `systemctl --user start`, reactivates both PipeWire user sockets, waits until
+  the server is ready, and then launches qpwgraph.
+- **Stop** stops `pipewire.socket` and `pipewire-pulse.socket` in the same
+  systemd transaction as the services, preventing immediate reactivation.
 - Once the server is up, all pre-existing application streams are reconnected
   to the hardware outputs.
 

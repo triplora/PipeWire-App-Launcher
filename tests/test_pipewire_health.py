@@ -27,10 +27,15 @@ from pipewire_launcher.pipewire_health import (
     pipewire_process_running,
     pipewire_running,
     qpwgraph_running,
+    restart_pipewire_services,
     restart_qpwgraph,
     restore_default_audio_links,
     run_command,
     start_pipewire_services,
+    start_pipewire_services_sync,
+    start_qpwgraph,
+    stop_pipewire_services,
+    stop_qpwgraph,
     systemd_unit_active,
 )
 
@@ -189,6 +194,7 @@ class StartPipeWireServicesTests(unittest.TestCase):
         )
         self.assertEqual(popen.calls[0][0], (
             "systemctl", "--user", "start",
+            "pipewire.socket", "pipewire-pulse.socket",
             "pipewire", "pipewire-pulse", "wireplumber",
         ))
         self.assertTrue(popen.calls[0][1]["start_new_session"])
@@ -197,6 +203,73 @@ class StartPipeWireServicesTests(unittest.TestCase):
         self.assertFalse(
             start_pipewire_services(resolver=lambda name: None, popen=FakePopen())
         )
+
+
+class PipeWireServiceControlTests(unittest.TestCase):
+    def test_start_stop_and_restart_are_argument_only_commands(self):
+        runner = FakeRunner()
+        self.assertTrue(restart_pipewire_services(
+            runner=runner, resolver=resolver
+        ))
+        self.assertIn((
+            "systemctl", "--user", "restart",
+            "pipewire", "pipewire-pulse", "wireplumber",
+        ), runner.calls)
+
+    def test_sync_start_reactivates_sockets_and_services(self):
+        runner = FakeRunner()
+
+        self.assertTrue(start_pipewire_services_sync(
+            runner=runner, resolver=resolver
+        ))
+
+        self.assertIn((
+            "systemctl", "--user", "start",
+            "pipewire.socket", "pipewire-pulse.socket",
+            "pipewire", "pipewire-pulse", "wireplumber",
+        ), runner.calls)
+
+    def test_sync_start_custom_services_keeps_activation_sockets(self):
+        runner = FakeRunner()
+
+        self.assertTrue(start_pipewire_services_sync(
+            services=("pipewire",), runner=runner, resolver=resolver
+        ))
+
+        self.assertIn((
+            "systemctl", "--user", "start",
+            "pipewire.socket", "pipewire-pulse.socket", "pipewire",
+        ), runner.calls)
+
+    def test_stop_includes_socket_activation_units(self):
+        runner = FakeRunner()
+
+        self.assertTrue(stop_pipewire_services(
+            runner=runner, resolver=resolver
+        ))
+
+        self.assertIn((
+            "systemctl", "--user", "stop",
+            "pipewire.socket", "pipewire-pulse.socket",
+            "pipewire", "pipewire-pulse", "wireplumber",
+        ), runner.calls)
+
+    def test_stop_custom_services_keeps_socket_activation_units(self):
+        runner = FakeRunner()
+
+        self.assertTrue(stop_pipewire_services(
+            services=("pipewire",), runner=runner, resolver=resolver
+        ))
+
+        self.assertIn((
+            "systemctl", "--user", "stop",
+            "pipewire.socket", "pipewire-pulse.socket", "pipewire",
+        ), runner.calls)
+
+    def test_control_fails_without_systemctl(self):
+        self.assertFalse(stop_pipewire_services(
+            runner=FakeRunner(), resolver=lambda _name: None
+        ))
 
 
 class PipeWireHealthCheckTests(unittest.TestCase):
@@ -411,7 +484,7 @@ class RecordingRestarter:
 
 
 class FakeQpwgraphRunner:
-    """Serves ``pgrep`` / ``killall`` answers for qpwgraph."""
+    """Serves process-probe and graceful-stop answers for qpwgraph."""
 
     def __init__(self, qpwgraph_present=True):
         self.qpwgraph_present = qpwgraph_present
@@ -422,13 +495,14 @@ class FakeQpwgraphRunner:
         self.calls.append(arguments)
         if list(arguments) == ["pgrep", "-x", "qpwgraph"]:
             return CommandResult(0 if self.qpwgraph_present else 1, "", "")
-        if list(arguments) == ["killall", "-9", "qpwgraph"]:
+        if list(arguments) == ["pkill", "-TERM", "-x", "qpwgraph"]:
+            self.qpwgraph_present = False
             return CommandResult(0, "", "")
         return CommandResult(0, "", "")
 
 
 def qpwgraph_resolver(name):
-    if name in {"pgrep", "killall", "qpwgraph"}:
+    if name in {"pgrep", "pkill", "qpwgraph"}:
         return f"/usr/bin/{name}"
     return None
 
@@ -852,6 +926,70 @@ class QpwgraphRunningTests(unittest.TestCase):
         )
 
 
+class QpwgraphLifecycleRunner:
+    def __init__(self, terminate_works=True):
+        self.present = True
+        self.terminate_works = terminate_works
+        self.calls = []
+
+    def __call__(self, arguments):
+        arguments = tuple(arguments)
+        self.calls.append(arguments)
+        if arguments == ("pgrep", "-x", "qpwgraph"):
+            return CommandResult(0 if self.present else 1, "", "")
+        if arguments == ("pkill", "-TERM", "-x", "qpwgraph"):
+            if self.terminate_works:
+                self.present = False
+            return CommandResult(0, "", "")
+        if arguments == ("pkill", "-KILL", "-x", "qpwgraph"):
+            self.present = False
+            return CommandResult(0, "", "")
+        return CommandResult(1, "", "")
+
+
+def qpwgraph_lifecycle_resolver(name):
+    if name in {"pgrep", "pkill", "qpwgraph"}:
+        return f"/usr/bin/{name}"
+    return None
+
+
+class QpwgraphLifecycleTests(unittest.TestCase):
+    def test_start_is_shell_free_and_detached(self):
+        popen = FakePopen()
+        self.assertTrue(start_qpwgraph(
+            resolver=qpwgraph_lifecycle_resolver, popen=popen
+        ))
+        self.assertEqual(popen.calls[0][0], ("qpwgraph",))
+        self.assertTrue(popen.calls[0][1]["start_new_session"])
+
+    def test_graceful_stop_uses_term_without_kill(self):
+        runner = QpwgraphLifecycleRunner(terminate_works=True)
+        self.assertTrue(stop_qpwgraph(
+            runner=runner,
+            resolver=qpwgraph_lifecycle_resolver,
+            timeout_ms=20,
+            poll_interval_ms=1,
+        ))
+        self.assertIn(("pkill", "-TERM", "-x", "qpwgraph"), runner.calls)
+        self.assertNotIn(("pkill", "-KILL", "-x", "qpwgraph"), runner.calls)
+
+    def test_stop_escalates_after_timeout(self):
+        runner = QpwgraphLifecycleRunner(terminate_works=False)
+        self.assertTrue(stop_qpwgraph(
+            runner=runner,
+            resolver=qpwgraph_lifecycle_resolver,
+            timeout_ms=5,
+            poll_interval_ms=1,
+        ))
+        self.assertIn(("pkill", "-TERM", "-x", "qpwgraph"), runner.calls)
+        self.assertIn(("pkill", "-KILL", "-x", "qpwgraph"), runner.calls)
+
+    def test_stop_fails_safely_without_pkill(self):
+        runner = QpwgraphLifecycleRunner()
+        resolver_ = lambda name: "/usr/bin/pgrep" if name == "pgrep" else None
+        self.assertFalse(stop_qpwgraph(runner=runner, resolver=resolver_))
+
+
 class RestartQpwgraphTests(unittest.TestCase):
     def test_kills_running_instance_and_launches_fresh(self):
         runner = FakeQpwgraphRunner(qpwgraph_present=True)
@@ -862,7 +1000,7 @@ class RestartQpwgraphTests(unittest.TestCase):
             popen=popen,
         )
         self.assertTrue(started)
-        self.assertIn(("killall", "-9", "qpwgraph"), runner.calls)
+        self.assertIn(("pkill", "-TERM", "-x", "qpwgraph"), runner.calls)
         self.assertEqual(popen.calls[0][0], ("qpwgraph",))
         self.assertTrue(popen.calls[0][1]["start_new_session"])
 
@@ -875,7 +1013,7 @@ class RestartQpwgraphTests(unittest.TestCase):
             popen=popen,
         )
         self.assertTrue(started)
-        self.assertNotIn(("killall", "-9", "qpwgraph"), runner.calls)
+        self.assertNotIn(("pkill", "-TERM", "-x", "qpwgraph"), runner.calls)
         self.assertEqual(len(popen.calls), 1)
 
     def test_missing_qpwgraph_binary_returns_false(self):
@@ -901,7 +1039,7 @@ class RestartQpwgraphTests(unittest.TestCase):
             popen=failing_popen,
         )
         self.assertFalse(started)
-        self.assertIn(("killall", "-9", "qpwgraph"), runner.calls)
+        self.assertIn(("pkill", "-TERM", "-x", "qpwgraph"), runner.calls)
 
 
 class IsNewStreamEventTests(unittest.TestCase):
@@ -1130,6 +1268,10 @@ class FakeStreamWatcher:
     def stop(self):
         self.stop_calls += 1
 
+    @property
+    def active(self):
+        return self.started and self.stop_calls == 0
+
 
 class PipeWireHealthCheckWatcherTests(unittest.TestCase):
     def setUp(self):
@@ -1223,6 +1365,18 @@ class PipeWireHealthCheckWatcherTests(unittest.TestCase):
         )
         self.assertTrue(check.check())
         self.assertIsNone(check._watcher)
+
+    def test_inactive_watcher_is_replaced_after_stack_restart(self):
+        runner = FakeRunner(initially_active=True)
+        check = self.check(runner, FakeMessageBox())
+        self.assertTrue(check.check())
+        first = FakeStreamWatcher.instances[-1]
+        first.started = False
+        check.start_watcher()
+        second = FakeStreamWatcher.instances[-1]
+        self.assertIsNot(first, second)
+        self.assertEqual(first.stop_calls, 1)
+        self.assertEqual(second.start_calls, 1)
 
 
 if __name__ == "__main__":
